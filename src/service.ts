@@ -249,11 +249,13 @@ export class Service {
     snapshot = JSON.parse(application.snapshot());
     console.log("transaction installed, rollup pool length is:", transactions_witness.length);
     try {
-      // const saveStart = performance.now();
-      const txRecord = new modelTx(tx);
-      await txRecord.save();
-      // const saveEnd = performance.now();
-      // console.log(`[${getTimestamp()}] txRecord.save took: ${saveEnd - saveStart}ms`);
+      if (!isReplay) {
+        // const saveStart = performance.now();
+        const txRecord = new modelTx(tx);
+        await txRecord.save();
+        // const saveEnd = performance.now();
+        // console.log(`[${getTimestamp()}] txRecord.save took: ${saveEnd - saveStart}ms`);
+      }
     } catch (e) {
       console.log("fatal: store tx failed ... process will terminate");
     }
@@ -285,19 +287,23 @@ export class Service {
         // const trackEnd = performance.now();
         // console.log(`[${getTimestamp()}] trackBundle took: ${trackEnd - trackStart}ms`);
 
-        // clear witness queue and set preMerkleRoot
-        transactions_witness = new Array();
+        // preserve witness for batch callback before clearing
+        const bundledTxs = transactions_witness;
+
+        // set pre/post roots for next bundle
         this.preMerkleRoot = this.merkleRoot;
 
         // need to update merkle_root as the input of next proof
         this.merkleRoot = application.query_root();
 
-
         // record all the txs externally so that the external db can preserve a snap shot
         // const batchStart = performance.now();
-        await this.txBatched(transactions_witness, merkleRootToBeHexString(this.preMerkleRoot), merkleRootToBeHexString(this.merkleRoot));
+        await this.txBatched(bundledTxs, merkleRootToBeHexString(this.preMerkleRoot), merkleRootToBeHexString(this.merkleRoot));
         // const batchEnd = performance.now();
         // console.log(`[${getTimestamp()}] txBatched took: ${batchEnd - batchStart}ms`);
+
+        // clear witness queue for next bundle
+        transactions_witness = new Array();
 
         // reset application here
         console.log("restore root:", this.merkleRoot);

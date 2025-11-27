@@ -1,0 +1,5 @@
+node_modules
+*.map
+src/*.js
+src/**/*.js
+src/**/*.js.map

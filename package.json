@@ -30,7 +30,7 @@
     "server": "node src/service.js",
     "settle": "node src/settle.js",
     "build": "npx tsc",
-    "test": "jest",
+    "test": "node --test test/**/*.js",
     "postinstall": "npm run build"
   }
 }
