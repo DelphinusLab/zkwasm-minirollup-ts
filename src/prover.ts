@@ -149,21 +149,6 @@ function wait(ms: number): Promise<void> {
       return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-export async function submitProofWithRetry(merkle: BigUint64Array, txs: Array<TxWitness>, txdata: Uint8Array) {
-  for (let i=0; i<10; i++) {
-    try {
-      let response = await timeout(submitProof(merkle, txs, txdata), 10000);
-      return response;
-    } catch (e) {
-      console.log("submit proof error:", e);
-      console.log("retrying ...");
-      await wait(10000);
-      continue;
-    }
-  }
-  console.log("can not generating proof ...");
-  process.exit(1);
-}
 
 export async function get_latest_proof(taskid: string | null): Promise<Task | null> {
   const helper = new ZkWasmServiceHelper(endpoint, "", "");
@@ -222,4 +207,25 @@ export async function has_task(): Promise<boolean> {
   let tasks = await helper.loadTasks(query);
   console.log(tasks);
   return tasks.data.length > 0;
+}
+
+export async function syncToFirstUnprovedBundle(guideMerkle: BigUint64Array): Promise<any | null> {
+  const { GlobalBundleService } = await import('./services/global-bundle-service.js');
+  const { merkleRootToBeHexString, hexStringToMerkleRoot } = await import('./lib.js');
+  
+  const globalBundleService = new GlobalBundleService();
+  let currentMerkle = merkleRootToBeHexString(guideMerkle);
+  let bundle = await globalBundleService.findBundleByMerkle(currentMerkle);
+  
+  while (bundle != null && bundle.taskId != "" && bundle.postMerkleRoot != null) {
+    const postMerkle = new BigUint64Array(hexStringToMerkleRoot(bundle.postMerkleRoot));
+    bundle = await globalBundleService.findBundleByMerkle(merkleRootToBeHexString(postMerkle));
+  }
+  
+  if(bundle != null && bundle.taskId == "") {
+    return bundle;
+  } else {
+    // (bundle == null) || (bundle != null && bundle.postMerkleRoot == null); 
+    return null;
+  }
 }
