@@ -6,18 +6,20 @@ import { verifySign, LeHexBN, sign, PlayerConvention, ZKWasmAppRpc, createComman
 import { Queue, Worker, Job } from 'bullmq';
 import IORedis from 'ioredis';
 import express, {Express} from 'express';
-import { submitProofWithRetry, has_uncomplete_task, TxWitness, get_latest_proof, has_task } from "./prover.js";
+import { has_uncomplete_task, TxWitness, get_latest_proof, has_task } from "./prover.js";
 import { ensureIndexes } from "./commit.js";
 import cors from "cors";
-import { get_mongoose_db, modelBundle, modelJob, modelRand, get_service_port, get_server_admin_key, modelTx, get_contract_addr, get_chain_id } from "./config.js";
+import { get_mongoose_db, modelBundle, modelJob, modelRand, get_service_port, get_server_admin_key, modelTx, get_contract_addr, get_chain_id, endpoint } from "./config.js";
 import { getMerkleArray } from "./contract.js";
-import { ZkWasmUtil } from "zkwasm-service-helper";
+import { ZkWasmUtil, ZkWasmServiceHelper } from "zkwasm-service-helper";
 import dotenv from 'dotenv';
 import mongoose from 'mongoose';
 import {hexStringToMerkleRoot, merkleRootToBeHexString} from "./lib.js";
 import {sha256} from "ethers";
 import {TxStateManager} from "./commit.js";
 import {queryAccounts, storeAccount} from "./account.js";
+import {ProofSubmissionService, handleNullTaskIdBundles} from "./service/proof-submission-service.js";
+import { get_image_md5 } from "./config.js";
 
 // Load environment variables from .env file
 dotenv.config();
@@ -104,6 +106,7 @@ export class Service {
   preMerkleRoot: BigUint64Array | null;
   txManager: TxStateManager;
   blocklist: Map<string, number>;
+  proofService!: ProofSubmissionService;
 
   constructor(
       cb: (arg: TxWitness, events: BigUint64Array) => Promise<void> = async (arg: TxWitness, events: BigUint64Array) => {},
@@ -178,7 +181,7 @@ export class Service {
       }
   }
 
-  async trackBundle(taskId: string) {
+  async trackBundle(taskId: string | null) {
     console.log("track bundle:", this.bundleIndex);
     let preMerkleRootStr = "";
     if (this.preMerkleRoot != null) {
@@ -270,7 +273,7 @@ export class Service {
       // let bundle = await this.trackBundle('');
       if (deploymode) {
         try {
-          task_id = await submitProofWithRetry(this.merkleRoot, transactions_witness, txdata);
+          await this.proofService.addTaskToStack(this.merkleRoot, transactions_witness, txdata);
         } catch (e) {
           console.log(e);
           process.exit(1); // this should never happen and we stop the whole process
@@ -347,6 +350,14 @@ export class Service {
         maxRetriesPerRequest: null  // Important: set this to null
       }
     );
+
+    // Initialize ProofSubmissionService
+    const helper = new ZkWasmServiceHelper(endpoint, "", "");
+    this.proofService = new ProofSubmissionService(connection, get_image_md5(), helper);
+    
+    // Handle null taskId bundles and recover tasks
+    await handleNullTaskIdBundles(this.proofService);
+    await this.proofService.recoverTasks();
 
     connection.on('end', () => {
       console.log("fatal: redis disconnected unexpected ...");
