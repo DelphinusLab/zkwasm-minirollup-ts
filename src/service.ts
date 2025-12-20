@@ -156,7 +156,8 @@ export class Service {
     let currentMerkle = merkleRootToBeHexString(this.merkleRoot);
     let prevMerkle = null;
     let bundle = await this.findBundleByMerkle(currentMerkle);
-    while (bundle != null && bundle.postMerkleRoot != null) {
+    // Check postMerkleRoot is non-null AND non-empty string to avoid BigInt('') error
+    while (bundle != null && bundle.postMerkleRoot && bundle.postMerkleRoot !== "") {
       const postMerkle = new BigUint64Array(hexStringToMerkleRoot(bundle.postMerkleRoot));
       console.log("sync merkle:", currentMerkle, "taskId:", bundle.taskId);
       bundle = await this.findBundleByMerkle(merkleRootToBeHexString(postMerkle));
@@ -164,16 +165,16 @@ export class Service {
         currentMerkle = bundle.merkleRoot;
         prevMerkle = bundle.preMerkleRoot;
         this.bundleIndex += 1;
-        // if (this.taskId != "") {
-        //   this.latestSubmittedBundleMerkle = this.merkleRoot;
-        // }
+        // Update latestSubmittedBundleMerkle when bundle has been proven (has taskId)
+        if (bundle.taskId && bundle.taskId !== "") {
+          this.latestSubmittedBundleMerkle = new BigUint64Array(hexStringToMerkleRoot(currentMerkle));
+        }
       }
     }
     console.log("final merkle:", currentMerkle);
     this.merkleRoot = new BigUint64Array(hexStringToMerkleRoot(currentMerkle));
     if (prevMerkle) {
       this.preMerkleRoot = new BigUint64Array(hexStringToMerkleRoot(prevMerkle));
-
     }
   }
 
@@ -303,7 +304,7 @@ export class Service {
       // console.log(`[${getTimestamp()}] application.finalize took: ${finalizeEnd - preemptStart}ms`);
       console.log("txdata is:", txdata);
       let task_id = null;
-      // sequence the merkle trace pre -> post merkel root
+      // sequence the merkle trace pre -> post merkle root
       try {
         console.log("proving task submitted at:", task_id);
         console.log("tracking task in db current ...", merkleRootToBeHexString(this.merkleRoot));
@@ -402,19 +403,19 @@ export class Service {
     //console.log(application);
     await (initApplication as any)(bootstrap);
 
-    console.log("check merkel database connection ...");
+    console.log("check merkle database connection ...");
     test_merkle_db_service();
 
     if (migrate) {
       if (remote) {
         throw Error("Can't migrate in remote mode");
       }
-      
+
       // Get contract state
       this.merkleRoot = await getMerkleArray();
       const targetMerkleRoot = merkleRootToBeHexString(this.merkleRoot);
       console.log("Migrate: target merkle root", targetMerkleRoot);
-      
+
       // Execute data migration to target state
       try {
         await this.migrationService.migrateDataToMerkleRoot(targetMerkleRoot, this.currentMD5);
@@ -423,6 +424,13 @@ export class Service {
         console.error("Migration failed:", migrationError);
         throw migrationError;
       }
+
+      // Start as independent new chain:
+      // - bundleIndex stays 0 (default) - new MD5 starts fresh
+      // - preMerkleRoot stays null (default) - no link to old MD5's bundles
+      // - only update latestSubmittedBundleMerkle for proof worker
+      this.latestSubmittedBundleMerkle = this.merkleRoot;
+      console.log(`Migrate: starting new independent chain from merkleRoot: ${targetMerkleRoot}`);
     } else if(remote) {
     //initialize merkle_root based on the latest task
       while (true) {

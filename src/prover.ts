@@ -212,20 +212,28 @@ export async function has_task(): Promise<boolean> {
 export async function syncToFirstUnprovedBundle(guideMerkle: BigUint64Array): Promise<any | null> {
   const { GlobalBundleService } = await import('./services/global-bundle-service.js');
   const { merkleRootToBeHexString, hexStringToMerkleRoot } = await import('./lib.js');
-  
+
   const globalBundleService = new GlobalBundleService();
-  let currentMerkle = merkleRootToBeHexString(guideMerkle);
-  let bundle = await globalBundleService.findBundleByMerkle(currentMerkle);
-  
-  while (bundle != null && bundle.taskId != "" && bundle.postMerkleRoot != null) {
-    const postMerkle = new BigUint64Array(hexStringToMerkleRoot(bundle.postMerkleRoot));
-    bundle = await globalBundleService.findBundleByMerkle(merkleRootToBeHexString(postMerkle));
-  }
-  
-  if(bundle != null && bundle.taskId == "") {
-    return bundle;
-  } else {
-    // (bundle == null) || (bundle != null && bundle.postMerkleRoot == null); 
-    return null;
+
+  try {
+    let currentMerkle = merkleRootToBeHexString(guideMerkle);
+    let bundle = await globalBundleService.findBundleByMerkle(currentMerkle);
+
+    // Continue traversing while bundle has taskId AND has valid postMerkleRoot (non-empty string)
+    // Empty string "" means proof not yet completed, so we should stop and not try to parse it
+    while (bundle != null && bundle.taskId !== "" && bundle.postMerkleRoot && bundle.postMerkleRoot !== "") {
+      const postMerkle = new BigUint64Array(hexStringToMerkleRoot(bundle.postMerkleRoot));
+      bundle = await globalBundleService.findBundleByMerkle(merkleRootToBeHexString(postMerkle));
+    }
+
+    if(bundle != null && bundle.taskId == "") {
+      return bundle;
+    } else {
+      // (bundle == null) || (bundle != null && bundle.postMerkleRoot == null);
+      return null;
+    }
+  } finally {
+    // Always close the connection to prevent connection leaks
+    await globalBundleService.close();
   }
 }

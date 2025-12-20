@@ -35,7 +35,7 @@ export function test_merkle_db_service() {
     console.log(jsonResponse);
   } else {
     console.error('Failed to fetch:', response.statusText);
-    throw ("Connecting with merkel db service fail!");
+    throw ("Connecting with merkle db service fail!");
   }
 }
 
