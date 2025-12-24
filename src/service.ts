@@ -580,7 +580,9 @@ export class Service {
           let signature = job.data.value;
           const verifySignatureStart = performance.now();
           let u64array = signature_to_u64array(signature);
-          application.verify_tx_signature(u64array);
+          if (!(job.name === 'transaction' && job.data.verified === true)) {
+            application.verify_tx_signature(u64array);
+          }
           const verifySignatureEnd = performance.now();
           if (LOG_TX) {
             console.log(`[${getTimestamp()}] ${job.name} verify_tx_signature took: ${verifySignatureEnd - verifySignatureStart}ms`);
@@ -703,7 +705,7 @@ export class Service {
             );
         }
 
-        const job = await this.queue!.add('transaction', { value });
+        const job = await this.queue!.add('transaction', { value, verified: true });
         return res.status(201).send({
           success: true,
           jobid: job.id
