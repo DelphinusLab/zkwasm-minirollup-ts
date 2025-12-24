@@ -4,6 +4,13 @@ const ps = {
 }
 const buffer = Buffer.alloc(4096);
 
+// Prevent EAGAIN tight-loop from burning CPU.
+const SLEEP_BUF = new SharedArrayBuffer(4);
+const SLEEP_ARR = new Int32Array(SLEEP_BUF);
+function sleepMs(ms) {
+  Atomics.wait(SLEEP_ARR, 0, 0, ms);
+}
+
 function requestMerkleData(requestData) {
   if (typeof window === "undefined") {
     if (ps.process == null) {
@@ -56,7 +63,7 @@ function requestMerkleData(requestData) {
            //console.log("bytesRead", bytesRead);
          } catch (error) {
            if (error && (error).code === "EAGAIN") {
-             //console.log("read bytes!", bytesRead);
+             sleepMs(1);
              continue;
            } else {
              throw error; // Re-throw other errors

@@ -1,5 +1,7 @@
 import { spawn } from "node:child_process";
+import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
+import { fileURLToPath } from "node:url";
 import { createCommand, sign } from "zkwasm-minirollup-rpc";
 
 const PORT = parseInt(process.env.PORT ?? "3001", 10);
@@ -14,6 +16,7 @@ const NONCE_BASE = BigInt(process.env.NONCE_BASE ?? Date.now());
 const WARMUP = parseInt(process.env.WARMUP ?? "0", 10);
 
 const BASE_URL = `http://127.0.0.1:${PORT}`;
+const TS_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 function log(...args) {
   console.log("[tps]", ...args);
@@ -101,6 +104,7 @@ try {
   if (START_SERVICE) {
     log("starting service", { PORT, IMAGE });
     service = spawn("node", ["src/run.js"], {
+      cwd: TS_ROOT,
       stdio: ["ignore", "inherit", "inherit"],
       env: { ...process.env, PORT: String(PORT), IMAGE },
     });

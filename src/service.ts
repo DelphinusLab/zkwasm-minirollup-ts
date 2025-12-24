@@ -3,6 +3,7 @@ import initBootstrap, * as bootstrap from "./bootstrap/bootstrap.js";
 import initApplication, * as application from "./application/application.js";
 import { test_merkle_db_service } from "./test.js";
 import { LeHexBN, sign, PlayerConvention, ZKWasmAppRpc, createCommand } from "zkwasm-minirollup-rpc";
+import { signature_to_u64array } from "./signature.js";
 import { Queue, Worker, Job } from 'bullmq';
 import IORedis from 'ioredis';
 import express, {Express} from 'express';
@@ -28,6 +29,11 @@ const LOG_QUEUE_STATS = process.env.LOG_QUEUE_STATS === '1';
 const LOG_AUTOJOB = process.env.LOG_AUTOJOB === '1';
 const DISABLE_AUTOTICK = process.env.DISABLE_AUTOTICK === '1';
 const AUTOJOB_FATAL = process.env.AUTOJOB_FATAL === '1';
+const DISABLE_SNAPSHOT = process.env.DISABLE_SNAPSHOT === '1';
+const DISABLE_MONGO_TX_STORE = process.env.DISABLE_MONGO_TX_STORE === '1';
+const DISABLE_MONGO_JOB_STORE = process.env.DISABLE_MONGO_JOB_STORE === '1';
+const ASYNC_MONGO_WRITES = process.env.ASYNC_MONGO_WRITES === '1';
+const LIGHT_JOB_RESULT = process.env.LIGHT_JOB_RESULT === '1';
 
 let deploymode = false;
 let remote = false;
@@ -267,20 +273,27 @@ export class Service {
         // console.log(`[${getTimestamp()}] txCallback took: ${callbackEnd - callbackStart}ms`);
     }
     // }
-    snapshot = JSON.parse(application.snapshot());
+    if (!DISABLE_SNAPSHOT) {
+      snapshot = JSON.parse(application.snapshot());
+    }
     if (LOG_TX) {
       console.log("transaction installed, rollup pool length is:", transactions_witness.length);
     }
-    try {
-      if (!isReplay) {
-        // const saveStart = performance.now();
-        const txRecord = new modelTx(tx);
-        await txRecord.save();
-        // const saveEnd = performance.now();
-        // console.log(`[${getTimestamp()}] txRecord.save took: ${saveEnd - saveStart}ms`);
+    if (!isReplay && !DISABLE_MONGO_TX_STORE) {
+      const txRecord = new modelTx(tx);
+      if (ASYNC_MONGO_WRITES) {
+        void txRecord.save().catch((e) => {
+          console.log("fatal: store tx failed ... process will terminate", e);
+          process.exit(1);
+        });
+      } else {
+        try {
+          await txRecord.save();
+        } catch (e) {
+          console.log("fatal: store tx failed ... process will terminate", e);
+          process.exit(1);
+        }
       }
-    } catch (e) {
-      console.log("fatal: store tx failed ... process will terminate");
     }
     if (application.preempt()) {
       // const preemptStart = performance.now();
@@ -603,24 +616,23 @@ export class Service {
             if (LOG_TX) {
               console.log(`[${getTimestamp()}] ${job.name} install_transactions took: ${installEnd - installStart}ms`);
             }
-            try {
-              // If this is the first time of running this tx, the store should work.
-              // If the store does not work (jobId conflict) then either there is a jobid
-              // conflict error in transaction mode or this is the second time running this
-              // transcation thus should in replay mode.
-              if (job.name != 'replay') {
-                  const jobRecord = new modelJob({
-                    jobId: signature.hash + signature.pkx,
-                    message: signature.message,
-                    result: "succeed",
-                  });
+            if (job.name != 'replay' && !DISABLE_MONGO_JOB_STORE) {
+              const jobRecord = new modelJob({
+                jobId: signature.hash + signature.pkx,
+                message: signature.message,
+                result: "succeed",
+              });
+              if (ASYNC_MONGO_WRITES) {
+                void jobRecord.save().catch((e) => {
+                  console.log("Error: store transaction job error", e);
+                });
+              } else {
+                try {
                   await jobRecord.save();
-              }
-            } catch (e) {
-              if (job.name != 'replay') {
-                // if in replay mode, the tx can not been stored twice thus the error is expected
-                console.log("Error: store transaction job error");
-                throw e
+                } catch (e) {
+                  console.log("Error: store transaction job error", e);
+                  throw e;
+                }
               }
             }
           } else {
@@ -631,6 +643,9 @@ export class Service {
           // const jobEndTime = performance.now();
           if (LOG_TX) {
             console.log("done");
+          }
+          if (LIGHT_JOB_RESULT) {
+            return { bundle: this.txManager.currentUncommitMerkleRoot };
           }
           let player = null;
           const getStateStartTime = performance.now();
@@ -901,26 +916,4 @@ export class Service {
     });
   }
 
-}
-
-function signature_to_u64array(value: any) {
-  const msg = new LeHexBN(value.msg).toU64Array(value.msg.length/16);
-  const pkx = new LeHexBN(value.pkx).toU64Array();
-  const pky = new LeHexBN(value.pky).toU64Array();
-  const sigx = new LeHexBN(value.sigx).toU64Array();
-  const sigy = new LeHexBN(value.sigy).toU64Array();
-  const sigr = new LeHexBN(value.sigr).toU64Array();
-
-  let u64array = new BigUint64Array(20 + value.msg.length/16);
-  u64array.set(pkx, 0);
-  u64array.set(pky, 4);
-  u64array.set(sigx, 8);
-  u64array.set(sigy, 12);
-  u64array.set(sigr, 16);
-  u64array.set(msg, 20);
-  let cmdLength = (msg[0] >> 8n) % 256n;
-  if (Number(cmdLength) != msg.length) {
-    throw Error("Wrong Command Size");
-  }
-  return u64array;
 }

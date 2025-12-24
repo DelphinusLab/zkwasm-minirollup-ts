@@ -1,7 +1,7 @@
-//import fetch from 'sync-fetch';
-import requestMerkleData from  './syncrpc.cjs';
+import requestMerkleData from './syncrpc.cjs';
 let url = 'http://127.0.0.1:3030';
 import dotenv from 'dotenv';
+import { createRequire } from 'node:module';
 dotenv.config();
 
 // Load environment variables from .env file
@@ -11,6 +11,41 @@ if (process.env.MERKLE_SERVER) {
 }
 
 console.log("rpc bind merkle server:", url);
+const MERKLE_RPC_MODE = process.env.MERKLE_RPC_MODE ?? 'syncproc';
+const require = createRequire(import.meta.url);
+let syncFetch;
+
+function requestMerkle(requestData) {
+  if (MERKLE_RPC_MODE === 'mock') {
+    let result;
+    switch (requestData?.method) {
+      case 'get_leaf':
+        result = { leaf: requestData?.params?.index };
+        break;
+      case 'get_record':
+        result = ['7', '8'];
+        break;
+      default:
+        result = { ok: true };
+    }
+    return JSON.stringify({ jsonrpc: '2.0', id: requestData?.id, result });
+  }
+  if (MERKLE_RPC_MODE === 'http') {
+    if (!syncFetch) {
+      syncFetch = require('sync-fetch');
+    }
+    const resp = syncFetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(requestData),
+    });
+    if (!resp.ok) {
+      throw new Error(`merkle rpc failed: ${resp.status}`);
+    }
+    return resp.text();
+  }
+  return requestMerkleData(requestData);
+}
 
 function hash2array(hash) {
   const hasharray = [];
@@ -37,7 +72,7 @@ function async_get_leaf(root, index) {
     id: 1
   };
   //console.log("get leaf", root);
-  let data = requestMerkleData(requestData);
+  let data = requestMerkle(requestData);
   const response = JSON.parse(data);
   if (response.error==undefined) {
     //console.log(jsonResponse);
@@ -67,7 +102,7 @@ function async_update_leaf(root, index, data) {
     id: 2
   };
   //console.log("get leaf", root);
-  let responseStr = requestMerkleData(requestData);
+  let responseStr = requestMerkle(requestData);
   const response = JSON.parse(responseStr);
   if (response.error==undefined) {
     //console.log(jsonResponse);
@@ -96,7 +131,7 @@ function async_update_record(hash, data) {
     params: {hash: roothash, data: datavec},
     id: 3
   };
-  let responseStr = requestMerkleData(requestData);
+  let responseStr = requestMerkle(requestData);
   const response = JSON.parse(responseStr);
   if (response.error==undefined) {
     return response.result;
@@ -125,7 +160,7 @@ function async_get_record(hash) {
     id: 4
   };
 
-  let responseStr = requestMerkleData(requestData);
+  let responseStr = requestMerkle(requestData);
   const response = JSON.parse(responseStr);
   if (response.error==undefined) {
     let result = response.result.map((x)=>{return BigInt(x)});
