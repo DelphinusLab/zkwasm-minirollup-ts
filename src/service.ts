@@ -19,6 +19,7 @@ import {hexStringToMerkleRoot, merkleRootToBeHexString} from "./lib.js";
 import {sha256} from "ethers";
 import {TxStateManager} from "./commit.js";
 import {ensureAccountIndexes, queryAccounts, storeAccount} from "./account.js";
+import { MongoWriteBuffer } from "./mongo_write_buffer.js";
 
 // Load environment variables from .env file
 dotenv.config();
@@ -33,6 +34,11 @@ const DISABLE_SNAPSHOT = process.env.DISABLE_SNAPSHOT === '1';
 const DISABLE_MONGO_TX_STORE = process.env.DISABLE_MONGO_TX_STORE === '1';
 const DISABLE_MONGO_JOB_STORE = process.env.DISABLE_MONGO_JOB_STORE === '1';
 const ASYNC_MONGO_WRITES = process.env.ASYNC_MONGO_WRITES === '1';
+const BATCH_MONGO_WRITES = process.env.BATCH_MONGO_WRITES === '1';
+const MONGO_BATCH_SIZE = Number.parseInt(process.env.MONGO_BATCH_SIZE ?? "200", 10);
+const MONGO_FLUSH_MS = Number.parseInt(process.env.MONGO_FLUSH_MS ?? "50", 10);
+const MONGO_BATCH_FATAL = process.env.MONGO_BATCH_FATAL !== '0';
+const MONGO_JOB_BATCH_FATAL = process.env.MONGO_JOB_BATCH_FATAL === '1';
 const LIGHT_JOB_RESULT = process.env.LIGHT_JOB_RESULT === '1';
 
 let deploymode = false;
@@ -117,6 +123,7 @@ export class Service {
   preMerkleRoot: BigUint64Array | null;
   txManager: TxStateManager;
   blocklist: Map<string, number>;
+  mongoWriteBuffer: MongoWriteBuffer | null;
 
   constructor(
       cb: (arg: TxWitness, events: BigUint64Array) => Promise<void> = async (arg: TxWitness, events: BigUint64Array) => {},
@@ -140,6 +147,7 @@ export class Service {
     this.preMerkleRoot = null;
     this.txManager = new TxStateManager(merkleRootToBeHexString(this.merkleRoot));
     this.blocklist = new Map();
+    this.mongoWriteBuffer = null;
   }
 
   async syncToLatestMerkelRoot() {
@@ -255,8 +263,9 @@ export class Service {
   }
 
 
-  async install_transactions(tx: TxWitness, jobid: string | undefined, events: BigUint64Array, isReplay = false) {
+  async install_transactions(tx: TxWitness, jobid: string | undefined, events: BigUint64Array, isReplay = false): Promise<boolean> {
     // const installStartTime = performance.now();
+    let bundled = false;
     if (LOG_TX) {
       console.log("installing transaction into rollup ...");
     }
@@ -280,22 +289,31 @@ export class Service {
       console.log("transaction installed, rollup pool length is:", transactions_witness.length);
     }
     if (!isReplay && !DISABLE_MONGO_TX_STORE) {
-      const txRecord = new modelTx(tx);
-      if (ASYNC_MONGO_WRITES) {
-        void txRecord.save().catch((e) => {
-          console.log("fatal: store tx failed ... process will terminate", e);
-          process.exit(1);
+      if (this.mongoWriteBuffer) {
+        this.mongoWriteBuffer.enqueueTx({
+          msg: tx.msg,
+          pkx: tx.pkx,
+          sigx: tx.sigx,
         });
       } else {
-        try {
-          await txRecord.save();
-        } catch (e) {
-          console.log("fatal: store tx failed ... process will terminate", e);
-          process.exit(1);
+        const txRecord = new modelTx(tx);
+        if (ASYNC_MONGO_WRITES) {
+          void txRecord.save().catch((e) => {
+            console.log("fatal: store tx failed ... process will terminate", e);
+            process.exit(1);
+          });
+        } else {
+          try {
+            await txRecord.save();
+          } catch (e) {
+            console.log("fatal: store tx failed ... process will terminate", e);
+            process.exit(1);
+          }
         }
       }
     }
     if (application.preempt()) {
+      bundled = true;
       // const preemptStart = performance.now();
       if (LOG_BUNDLE) {
         console.log("rollup reach its preemption point, generating proof:");
@@ -367,6 +385,7 @@ export class Service {
     // let current_merkle_root = application.query_root();
     // const installEndTime = performance.now();
     // console.log("transaction installed with last root:", current_merkle_root);
+    return bundled;
   }
 
   async initialize() {
@@ -387,6 +406,17 @@ export class Service {
     // Call ensureIndexes after connection is established
     await ensureIndexes();
     await ensureAccountIndexes();
+
+    if (BATCH_MONGO_WRITES) {
+      this.mongoWriteBuffer = new MongoWriteBuffer({
+        txCollection: modelTx.collection as any,
+        jobCollection: modelJob.collection as any,
+        batchSize: MONGO_BATCH_SIZE,
+        flushMs: MONGO_FLUSH_MS,
+        fatalTxError: MONGO_BATCH_FATAL,
+        fatalJobError: MONGO_JOB_BATCH_FATAL,
+      });
+    }
 
     console.log("connecting redis server:", redisHost);
     const connection = new IORedis(
@@ -567,7 +597,10 @@ export class Service {
           }
           
           const installStart = performance.now();
-          await this.install_transactions(signature, job.id, txResult);
+          const bundled = await this.install_transactions(signature, job.id, txResult);
+          if (bundled && this.mongoWriteBuffer) {
+            await this.mongoWriteBuffer.flush("bundle");
+          }
           const installEnd = performance.now();
           if (LOG_AUTOJOB) {
             console.log(`[${getTimestamp()}] AutoJob install_transactions took: ${installEnd - installStart}ms`);
@@ -611,29 +644,40 @@ export class Service {
           if (errorCode == 0n) {
             // make sure install transaction will succeed
             const installStart = performance.now();
-            await this.install_transactions(signature, job.id, txResult, job.name=='replay');
+            const bundled = await this.install_transactions(signature, job.id, txResult, job.name=='replay');
             const installEnd = performance.now();
             if (LOG_TX) {
               console.log(`[${getTimestamp()}] ${job.name} install_transactions took: ${installEnd - installStart}ms`);
             }
             if (job.name != 'replay' && !DISABLE_MONGO_JOB_STORE) {
-              const jobRecord = new modelJob({
-                jobId: signature.hash + signature.pkx,
-                message: signature.message,
-                result: "succeed",
-              });
-              if (ASYNC_MONGO_WRITES) {
-                void jobRecord.save().catch((e) => {
-                  console.log("Error: store transaction job error", e);
+              if (this.mongoWriteBuffer) {
+                this.mongoWriteBuffer.enqueueJob({
+                  jobId: signature.hash + signature.pkx,
+                  message: signature.message,
+                  result: "succeed",
                 });
               } else {
-                try {
-                  await jobRecord.save();
-                } catch (e) {
-                  console.log("Error: store transaction job error", e);
-                  throw e;
+                const jobRecord = new modelJob({
+                  jobId: signature.hash + signature.pkx,
+                  message: signature.message,
+                  result: "succeed",
+                });
+                if (ASYNC_MONGO_WRITES) {
+                  void jobRecord.save().catch((e) => {
+                    console.log("Error: store transaction job error", e);
+                  });
+                } else {
+                  try {
+                    await jobRecord.save();
+                  } catch (e) {
+                    console.log("Error: store transaction job error", e);
+                    throw e;
+                  }
                 }
               }
+            }
+            if (bundled && this.mongoWriteBuffer) {
+              await this.mongoWriteBuffer.flush("bundle");
             }
           } else {
             let errorMsg = application.decode_error(Number(errorCode));
