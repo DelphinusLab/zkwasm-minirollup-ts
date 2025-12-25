@@ -9,6 +9,10 @@ const TOTAL = parseInt(process.env.TOTAL ?? "200", 10);
 const CONCURRENCY = parseInt(process.env.CONCURRENCY ?? "20", 10);
 const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS ?? "200", 10);
 const JOB_TIMEOUT_MS = parseInt(process.env.JOB_TIMEOUT_MS ?? "120000", 10);
+const POLL_MODE = process.env.POLL_MODE ?? "redis";
+const REDIS_HOST = process.env.REDISHOST ?? "localhost";
+const REDIS_PORT = parseInt(process.env.REDIS_PORT ?? "6379", 10);
+const QUEUE_NAME = process.env.QUEUE_NAME ?? "sequencer";
 const ADMIN_KEY = process.env.SERVER_ADMIN_KEY ?? "1234567";
 const IMAGE = process.env.IMAGE ?? "0123456789abcdef0123456789abcdef";
 const START_SERVICE = process.env.START_SERVICE !== "0";
@@ -99,7 +103,39 @@ async function pollJobs(jobIds) {
   return { pending, failed };
 }
 
+async function pollQueueByRedis(expected, monitor) {
+  const pending = new Set();
+  const failed = { size: 0 };
+  const deadline = Date.now() + JOB_TIMEOUT_MS;
+
+  const { queue, startCompleted, startFailed } = monitor;
+  let finalCounts = await queue.getJobCounts("completed", "failed");
+
+  while (Date.now() <= deadline) {
+    finalCounts = await queue.getJobCounts("completed", "failed");
+    const completed = (finalCounts.completed ?? 0) - startCompleted;
+    const failCount = (finalCounts.failed ?? 0) - startFailed;
+    const done = completed + failCount;
+    if (done >= expected) {
+      break;
+    }
+    await sleep(POLL_INTERVAL_MS);
+  }
+
+  // If we timed out, expose a synthetic pending size to keep output stable.
+  const completed = (finalCounts.completed ?? 0) - startCompleted;
+  const failCount = (finalCounts.failed ?? 0) - startFailed;
+  failed.size = failCount;
+  const done = Math.min(expected, completed + failCount);
+  for (let i = done; i < expected; i++) {
+    pending.add(String(i));
+  }
+
+  return { pending, failed };
+}
+
 let service;
+let redisMonitor;
 try {
   if (START_SERVICE) {
     log("starting service", { PORT, IMAGE });
@@ -112,6 +148,24 @@ try {
 
   await waitForReady();
   log("service ready");
+
+  if (POLL_MODE === "redis") {
+    const { Queue } = await import("bullmq");
+    const { default: IORedis } = await import("ioredis");
+    const connection = new IORedis({
+      host: REDIS_HOST,
+      port: REDIS_PORT,
+      maxRetriesPerRequest: null,
+    });
+    const queue = new Queue(QUEUE_NAME, { connection });
+    const startCounts = await queue.getJobCounts("completed", "failed");
+    redisMonitor = {
+      queue,
+      connection,
+      startCompleted: startCounts.completed ?? 0,
+      startFailed: startCounts.failed ?? 0,
+    };
+  }
 
   const payloads = [];
   const totalWithWarmup = TOTAL + WARMUP;
@@ -153,7 +207,11 @@ try {
   await Promise.all(sendWorkers);
   log("sent", { total: runPayloads.length, sendErrors });
 
-  const { pending, failed } = await pollJobs(jobIds.filter(Boolean));
+  const expected = jobIds.filter(Boolean).length;
+  const { pending, failed } =
+    POLL_MODE === "redis"
+      ? await pollQueueByRedis(expected, redisMonitor)
+      : await pollJobs(jobIds.filter(Boolean));
   const end = performance.now();
   const durationSec = (end - start) / 1000;
   const finished = jobIds.length - pending.size - sendErrors;
@@ -170,6 +228,13 @@ try {
   console.error("[tps] error", err);
   process.exitCode = 1;
 } finally {
+  if (redisMonitor) {
+    try {
+      await redisMonitor.queue.close();
+    } finally {
+      redisMonitor.connection.disconnect();
+    }
+  }
   if (service) {
     service.kill("SIGTERM");
   }

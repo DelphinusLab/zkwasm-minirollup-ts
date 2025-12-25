@@ -1,5 +1,7 @@
 import mongoose from 'mongoose';
 import { TxWitness } from './prover.js';
+
+const ASYNC_COMMIT_WRITES = process.env.ASYNC_COMMIT_WRITES === '1';
 const txSchema = new mongoose.Schema({
   msg: { type: String, required: true },
   pkx: { type: String, required: true },
@@ -132,11 +134,18 @@ export class TxStateManager {
         return true;
       }
       try {
-        await CommitModel.findOneAndUpdate(
-          { key },
-          { $setOnInsert: { key }, $push: { items: tx } },
-          { upsert: true }
+        const write = CommitModel.findOneAndUpdate(
+            { key },
+            { $setOnInsert: { key }, $push: { items: tx } },
+            { upsert: true }
         );
+        if (ASYNC_COMMIT_WRITES) {
+          void write.catch((error) => {
+            console.error('Error inserting tx into current bundle:', error);
+          });
+        } else {
+          await write;
+        }
         return false; // new tx, needs track
       } catch (error) {
         console.error('Error inserting tx into current bundle:', error);

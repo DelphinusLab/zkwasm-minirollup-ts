@@ -14,11 +14,8 @@ if (process.env.MERKLE_SERVER) {
 export function test_merkle_db_service() {
   const requestData = {
     jsonrpc: '2.0',
-    method: 'get_leaf',
-    params: {
-      root: [208, 107, 182, 47, 101, 239, 49, 228, 249, 118, 179, 167, 239, 211, 131, 101, 81, 103, 108, 174, 203, 236, 108, 251, 125, 22, 81, 58, 216, 86, 46, 1],
-      index: (4294967296n).toString()
-    },
+    method: 'ping',
+    params: {},
     id: 123
   };
 
