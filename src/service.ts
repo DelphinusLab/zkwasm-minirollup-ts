@@ -92,6 +92,15 @@ const OPTIMISTIC_SERIAL_COOLDOWN_MS = (() => {
   if (Number.isFinite(raw) && raw >= 0) return raw;
   return 1000;
 })();
+const OPTIMISTIC_QUEUE_CONCURRENCY = (() => {
+  const raw = Number.parseInt(process.env.OPTIMISTIC_QUEUE_CONCURRENCY ?? "", 10);
+  if (Number.isFinite(raw) && raw > 0) return raw;
+  if (OPTIMISTIC_APPLY) {
+    // Need >1 so multiple jobs can enqueue into OptimisticSequencer and form batches.
+    return Math.max(OPTIMISTIC_BATCH, OPTIMISTIC_WORKERS * 4);
+  }
+  return 1;
+})();
 
 type PreexecTrace = {
   reads: string[];
@@ -1422,7 +1431,10 @@ export class Service {
       if (LOG_TX) {
         console.log(`[${getTimestamp()}] ${job.name} completed in ${jobEndTime - jobStartTime}ms`);
       }
-    }, {connection});
+    }, {
+      connection,
+      concurrency: OPTIMISTIC_QUEUE_CONCURRENCY,
+    });
   }
 
   async serve() {
