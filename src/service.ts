@@ -1,5 +1,6 @@
 //import initHostBind, * as hostbind from "./wasmbind/hostbind.js";
 import initBootstrap, * as bootstrap from "./bootstrap/bootstrap.js";
+import { begin_session, commit_session, drop_session } from "./bootstrap/rpcbind.js";
 import initApplication, * as application from "./application/application.js";
 import { test_merkle_db_service } from "./test.js";
 import { LeHexBN, sign, PlayerConvention, ZKWasmAppRpc, createCommand } from "zkwasm-minirollup-rpc";
@@ -40,6 +41,7 @@ const MONGO_FLUSH_MS = Number.parseInt(process.env.MONGO_FLUSH_MS ?? "50", 10);
 const MONGO_BATCH_FATAL = process.env.MONGO_BATCH_FATAL !== '0';
 const MONGO_JOB_BATCH_FATAL = process.env.MONGO_JOB_BATCH_FATAL === '1';
 const LIGHT_JOB_RESULT = process.env.LIGHT_JOB_RESULT === '1';
+const MERKLE_SESSION_OVERLAY = process.env.MERKLE_SESSION_OVERLAY === '1';
 
 let deploymode = false;
 let remote = false;
@@ -124,6 +126,7 @@ export class Service {
   txManager: TxStateManager;
   blocklist: Map<string, number>;
   mongoWriteBuffer: MongoWriteBuffer | null;
+  merkleSession: string | null;
 
   constructor(
       cb: (arg: TxWitness, events: BigUint64Array) => Promise<void> = async (arg: TxWitness, events: BigUint64Array) => {},
@@ -148,6 +151,7 @@ export class Service {
     this.txManager = new TxStateManager(merkleRootToBeHexString(this.merkleRoot));
     this.blocklist = new Map();
     this.mongoWriteBuffer = null;
+    this.merkleSession = null;
   }
 
   async syncToLatestMerkelRoot() {
@@ -375,6 +379,13 @@ export class Service {
         }
         application.initialize(this.merkleRoot);
         await this.txManager.moveToCommit(merkleRootToBeHexString(this.merkleRoot));
+
+        if (MERKLE_SESSION_OVERLAY && this.merkleSession) {
+          const commitResult = commit_session(this.merkleSession);
+          if (LOG_BUNDLE) {
+            console.log("merkle overlay committed:", commitResult);
+          }
+        }
         // const resetEnd = performance.now();
         // console.log(`[${getTimestamp()}] Application reset took: ${resetEnd - resetStart}ms`);
       } catch (e) {
@@ -448,6 +459,25 @@ export class Service {
 
     console.log("check merkel database connection ...");
     test_merkle_db_service();
+
+    if (MERKLE_SESSION_OVERLAY) {
+      try {
+        this.merkleSession = begin_session();
+        (globalThis as any).__MERKLE_SESSION = this.merkleSession;
+        console.log("merkle session overlay enabled:", this.merkleSession);
+        process.once("exit", () => {
+          if (!this.merkleSession) return;
+          try {
+            drop_session(this.merkleSession);
+          } catch {
+            // ignore
+          }
+        });
+      } catch (e) {
+        console.log("fatal: begin merkle session failed", e);
+        process.exit(1);
+      }
+    }
 
     if (migrate) {
       if (remote) {

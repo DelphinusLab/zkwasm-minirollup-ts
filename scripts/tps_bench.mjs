@@ -14,16 +14,33 @@ const REDIS_HOST = process.env.REDISHOST ?? "localhost";
 const REDIS_PORT = parseInt(process.env.REDIS_PORT ?? "6379", 10);
 const QUEUE_NAME = process.env.QUEUE_NAME ?? "sequencer";
 const ADMIN_KEY = process.env.SERVER_ADMIN_KEY ?? "1234567";
+const COMMAND = BigInt(process.env.COMMAND ?? "0");
 const IMAGE = process.env.IMAGE ?? "0123456789abcdef0123456789abcdef";
 const START_SERVICE = process.env.START_SERVICE !== "0";
 const NONCE_BASE = BigInt(process.env.NONCE_BASE ?? Date.now());
 const WARMUP = parseInt(process.env.WARMUP ?? "0", 10);
+const KEY_COUNT = parseInt(process.env.KEY_COUNT ?? "1", 10);
+const KEY_BASE_RAW = process.env.KEY_BASE ?? ADMIN_KEY;
+let KEY_BASE = null;
+try {
+  KEY_BASE = BigInt(KEY_BASE_RAW);
+} catch {
+  KEY_BASE = null;
+}
 
 const BASE_URL = `http://127.0.0.1:${PORT}`;
 const TS_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 function log(...args) {
   console.log("[tps]", ...args);
+}
+
+function keyFor(i) {
+  if (KEY_COUNT <= 1) return ADMIN_KEY;
+  if (KEY_BASE === null) {
+    throw new Error("KEY_BASE must be a valid integer when KEY_COUNT > 1");
+  }
+  return (KEY_BASE + BigInt(i % KEY_COUNT)).toString();
 }
 
 async function waitForReady() {
@@ -170,8 +187,8 @@ try {
   const payloads = [];
   const totalWithWarmup = TOTAL + WARMUP;
   for (let i = 0; i < totalWithWarmup; i++) {
-    const cmd = createCommand(NONCE_BASE + BigInt(i), 0n, [0n, 0n, 0n, 0n]);
-    payloads.push(sign(cmd, ADMIN_KEY));
+    const cmd = createCommand(NONCE_BASE + BigInt(i), COMMAND, [0n, 0n, 0n, 0n]);
+    payloads.push(sign(cmd, keyFor(i)));
   }
 
   if (WARMUP > 0) {

@@ -278,3 +278,20 @@ export function reset_session(session) {
     throw new Error('Failed to reset_session');
   }
 }
+
+export function commit_session(session) {
+  const requestData = {
+    jsonrpc: '2.0',
+    method: 'commit_session',
+    params: { session },
+    id: 8,
+  };
+  const responseStr = requestMerkle(requestData);
+  const response = JSON.parse(responseStr);
+  if (response.error == undefined) {
+    return response.result;
+  } else {
+    console.error('Failed to commit_session:', response.error);
+    throw new Error('Failed to commit_session');
+  }
+}
