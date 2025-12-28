@@ -11,6 +11,7 @@ type PreexecRequest = {
   root: bigint[];
   signature: TxWitness;
   skipVerify?: boolean;
+  session?: string | null;
 };
 
 type Trace = {
@@ -106,6 +107,10 @@ function setOverlay(overlay: { leaves: Map<string, number[]>; records: Map<strin
   (globalThis as any).__MERKLE_TRACE_OVERLAY = overlay;
 }
 
+function setMerkleSession(session: string | null) {
+  (globalThis as any).__MERKLE_SESSION = session;
+}
+
 await (initBootstrap as any)();
 await (initApplication as any)(bootstrap);
 
@@ -119,6 +124,7 @@ let lastRootKey: string | null = null;
 parentPort.on("message", (msg: PreexecRequest) => {
   void (async () => {
     try {
+      setMerkleSession(typeof msg.session === "string" ? msg.session : null);
       const rootKey = msg.root.join(",");
       if (!PREEXEC_REUSE_INITIALIZE || lastRootKey !== rootKey) {
         const root = new BigUint64Array(msg.root);

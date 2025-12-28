@@ -41,6 +41,7 @@ const LOG_BUNDLE = process.env.LOG_BUNDLE === '1';
 const LOG_QUEUE_STATS = process.env.LOG_QUEUE_STATS === '1';
 const LOG_AUTOJOB = process.env.LOG_AUTOJOB === '1';
 const LOG_OPTIMISTIC = process.env.LOG_OPTIMISTIC === '1';
+const LOG_OPTIMISTIC_PROFILE = process.env.LOG_OPTIMISTIC_PROFILE === '1';
 const DISABLE_AUTOTICK = process.env.DISABLE_AUTOTICK === '1';
 const AUTOJOB_FATAL = process.env.AUTOJOB_FATAL === '1';
 const DISABLE_SNAPSHOT = process.env.DISABLE_SNAPSHOT === '1';
@@ -160,6 +161,7 @@ type PreexecRequest = {
   root: bigint[];
   signature: TxWitness;
   skipVerify?: boolean;
+  session?: string | null;
 };
 
 function u64ToLeBytes(value: bigint): number[] {
@@ -460,11 +462,25 @@ class OptimisticSequencer {
     this.flushing = true;
     try {
       while (this.pending.length > 0) {
+        const batchStart = performance.now();
+        let preexecWallMs = 0;
+        let applyWallMs = 0;
+        let installWallMs = 0;
+        let serialWallMs = 0;
+        let preexecHandleTxSumMs = 0;
+        let preexecVerifySumMs = 0;
+        let preexecOk = 0;
+        let preexecErr = 0;
+        let applyWrites = 0;
+        let applyUpdateRecords = 0;
+
         if (OPTIMISTIC_SERIAL_COOLDOWN_MS > 0 && Date.now() < this.serialUntilMs) {
           const batch = this.pending.splice(0, OPTIMISTIC_BATCH);
           for (const p of batch) {
             try {
+              const serialStart = performance.now();
               const result = await this.applySerial(p);
+              serialWallMs += performance.now() - serialStart;
               p.resolve(result);
             } catch (e) {
               p.reject(e);
@@ -478,6 +494,7 @@ class OptimisticSequencer {
         const snapshotRoot = bytes32ToRootU64(this.rootBytes);
         const rootArr = Array.from(snapshotRoot);
 
+        const preexecStart = performance.now();
         const preexecs = await Promise.all(
           batch.map((p) =>
             this.pool.exec({
@@ -485,9 +502,11 @@ class OptimisticSequencer {
               root: rootArr,
               signature: (p.job.data as any).value as TxWitness,
               skipVerify: (p.job.data as any).verified === true,
+              session: MERKLE_SESSION_OVERLAY ? this.service.merkleSession : null,
             }),
           ),
         );
+        preexecWallMs += performance.now() - preexecStart;
 
         const unionWrites = new Set<string>();
         const unionReads = new Set<string>();
@@ -498,8 +517,14 @@ class OptimisticSequencer {
           const p = batch[i]!;
           const resp = preexecs[i]!;
           if (!resp.ok) {
+            preexecErr += 1;
             p.reject(new Error(resp.error));
             continue;
+          }
+          preexecOk += 1;
+          preexecHandleTxSumMs += resp.timingMs.handleTx ?? 0;
+          if (typeof resp.timingMs.verify === "number") {
+            preexecVerifySumMs += resp.timingMs.verify;
           }
 
           const { reads, writes } = buildRwSets(resp.trace);
@@ -538,25 +563,33 @@ class OptimisticSequencer {
           let roots: number[][] = [];
           let finalRootBytes: number[] | null = null;
           try {
+            const applyStart = performance.now();
             const txs = segment.map((item) => ({
               writes: item.resp.trace.writes ?? [],
               updateRecords: item.resp.trace.updateRecords ?? [],
             }));
+            for (const tx of txs) {
+              applyWrites += tx.writes.length;
+              applyUpdateRecords += tx.updateRecords.length;
+            }
             if (LIGHT_JOB_RESULT) {
-              finalRootBytes = await withMerkleSessionDisabledAsync(() => apply_txs_final_async(this.rootBytes, txs));
+              const doApply = () => apply_txs_final_async(this.rootBytes, txs);
+              finalRootBytes = MERKLE_SESSION_OVERLAY ? await doApply() : await withMerkleSessionDisabledAsync(doApply);
               if (!Array.isArray(finalRootBytes) || finalRootBytes.length !== 32) {
                 throw new Error(
                   `apply_txs_final returned ${Array.isArray(finalRootBytes) ? finalRootBytes.length : typeof finalRootBytes} bytes, expected 32`,
                 );
               }
             } else {
-              roots = await withMerkleSessionDisabledAsync(() => apply_txs_async(this.rootBytes, txs));
+              const doApply = () => apply_txs_async(this.rootBytes, txs);
+              roots = MERKLE_SESSION_OVERLAY ? await doApply() : await withMerkleSessionDisabledAsync(doApply);
               if (!Array.isArray(roots) || roots.length !== segment.length) {
                 throw new Error(
                   `apply_txs returned ${Array.isArray(roots) ? roots.length : typeof roots} roots, expected ${segment.length}`,
                 );
               }
             }
+            applyWallMs += performance.now() - applyStart;
           } catch (e) {
             for (const item of segment) {
               item.p.reject(e);
@@ -569,6 +602,7 @@ class OptimisticSequencer {
             this.service.optimisticHeadRoot = bytes32ToRootU64(this.rootBytes);
           }
 
+          const installStart = performance.now();
           for (let i = 0; i < segment.length; i++) {
             const item = segment[i]!;
             const signature = (item.p.job.data as any).value as TxWitness;
@@ -591,11 +625,14 @@ class OptimisticSequencer {
               item.p.reject(e);
             }
           }
+          installWallMs += performance.now() - installStart;
         }
 
         for (const p of deferred) {
           try {
+            const serialStart = performance.now();
             const result = await this.applySerial(p);
+            serialWallMs += performance.now() - serialStart;
             p.resolve(result);
           } catch (e) {
             p.reject(e);
@@ -622,6 +659,28 @@ class OptimisticSequencer {
           // All jobs in this batch failed during preexec; yield to allow more enqueues.
           break;
         }
+
+        if (LOG_OPTIMISTIC_PROFILE) {
+          const batchWallMs = performance.now() - batchStart;
+          const ratio = considered > 0 ? chosen.length / considered : 0;
+          console.log("optimistic profile batch", {
+            pending: batch.length,
+            chosen: chosen.length,
+            deferred: deferred.length,
+            preexecOk,
+            preexecErr,
+            chosenRatio: ratio.toFixed(3),
+            preexecWallMs: preexecWallMs.toFixed(2),
+            applyWallMs: applyWallMs.toFixed(2),
+            installWallMs: installWallMs.toFixed(2),
+            serialWallMs: serialWallMs.toFixed(2),
+            preexecHandleTxSumMs: preexecHandleTxSumMs.toFixed(2),
+            preexecVerifySumMs: preexecVerifySumMs.toFixed(2),
+            applyWrites,
+            applyUpdateRecords,
+            batchWallMs: batchWallMs.toFixed(2),
+          });
+        }
       }
     } finally {
       this.flushing = false;
@@ -636,32 +695,62 @@ class OptimisticSequencer {
   }
 
   private async flushBundle(postRootBytes: number[]) {
+    const profileStart = performance.now();
     const postRootU64 = bytes32ToRootU64(postRootBytes);
 
     // Track bundle using pre-root (service.merkleRoot), then advance to post-root.
+    const trackStart = performance.now();
     await this.service.trackBundle("");
+    const trackMs = performance.now() - trackStart;
 
     const bundledTxs = transactions_witness;
     this.service.preMerkleRoot = this.service.merkleRoot;
     this.service.merkleRoot = postRootU64;
     this.service.optimisticHeadRoot = this.service.merkleRoot;
 
+    const batchStart = performance.now();
     await this.service.txBatched(
       bundledTxs,
       merkleRootToBeHexString(this.service.preMerkleRoot),
       merkleRootToBeHexString(this.service.merkleRoot),
     );
+    const batchMs = performance.now() - batchStart;
 
     transactions_witness = new Array();
 
+    const resetStart = performance.now();
     if (process.env.RELOAD_WASM_ON_BUNDLE === "1") {
       await (initApplication as any)(bootstrap);
     }
     application.initialize(this.service.merkleRoot);
     await this.service.txManager.moveToCommit(merkleRootToBeHexString(this.service.merkleRoot));
+    const resetMs = performance.now() - resetStart;
 
+    const commitStart = performance.now();
+    if (MERKLE_SESSION_OVERLAY && this.service.merkleSession) {
+      const commitResult = commit_session(this.service.merkleSession);
+      if (LOG_BUNDLE) {
+        console.log("merkle overlay committed:", commitResult);
+      }
+    }
+    const commitMs = performance.now() - commitStart;
+
+    const mongoStart = performance.now();
     if (this.service.mongoWriteBuffer) {
       await this.service.mongoWriteBuffer.flush("bundle");
+    }
+    const mongoMs = performance.now() - mongoStart;
+
+    if (LOG_OPTIMISTIC_PROFILE) {
+      console.log("optimistic profile bundle", {
+        txs: bundledTxs.length,
+        trackMs: trackMs.toFixed(2),
+        txBatchedMs: batchMs.toFixed(2),
+        resetMs: resetMs.toFixed(2),
+        merkleCommitMs: commitMs.toFixed(2),
+        mongoFlushMs: mongoMs.toFixed(2),
+        totalMs: (performance.now() - profileStart).toFixed(2),
+      });
     }
   }
 
@@ -697,7 +786,7 @@ class OptimisticSequencer {
       application.verify_tx_signature(u64array);
     }
 
-    const txResult = withMerkleSessionDisabled(() => application.handle_tx(u64array));
+    const txResult = MERKLE_SESSION_OVERLAY ? application.handle_tx(u64array) : withMerkleSessionDisabled(() => application.handle_tx(u64array));
     const errorCode = txResult[0];
     if (errorCode !== 0n) {
       throw new Error(application.decode_error(Number(errorCode)));

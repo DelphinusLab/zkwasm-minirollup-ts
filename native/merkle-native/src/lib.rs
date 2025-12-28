@@ -3,7 +3,7 @@ use napi_derive::napi;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use zkwasm_host_circuits::constants::MERKLE_DEPTH;
 use zkwasm_host_circuits::host::datahash::{DataHashRecord, MongoDataHash};
@@ -13,7 +13,7 @@ use zkwasm_host_circuits::host::mongomerkle::{MerkleRecord, MongoMerkle};
 
 static DB: OnceLock<RocksDB> = OnceLock::new();
 static DB_URI: OnceLock<String> = OnceLock::new();
-static SESSIONS: OnceLock<Mutex<HashMap<String, Arc<Mutex<OverlayState>>>>> = OnceLock::new();
+static SESSIONS: OnceLock<RwLock<HashMap<String, Arc<RwLock<OverlayState>>>>> = OnceLock::new();
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Default)]
@@ -25,14 +25,21 @@ struct OverlayState {
 #[derive(Clone)]
 struct SessionDB {
   base: RocksDB,
-  overlay: Arc<Mutex<OverlayState>>,
+  overlay: Arc<RwLock<OverlayState>>,
+}
+
+#[derive(Clone)]
+struct BatchDB {
+  base: RocksDB,
+  merkle: std::rc::Rc<std::cell::RefCell<HashMap<[u8; 32], MerkleRecord>>>,
+  data: std::rc::Rc<std::cell::RefCell<HashMap<[u8; 32], DataHashRecord>>>,
 }
 
 impl TreeDB for SessionDB {
   fn get_merkle_record(&self, hash: &[u8; 32]) -> anyhow::Result<Option<MerkleRecord>> {
     let guard = self
       .overlay
-      .lock()
+      .read()
       .map_err(|_| anyhow::anyhow!("overlay lock poisoned"))?;
     if let Some(record) = guard.merkle.get(hash) {
       return Ok(record.clone());
@@ -44,7 +51,7 @@ impl TreeDB for SessionDB {
   fn set_merkle_record(&mut self, record: MerkleRecord) -> anyhow::Result<()> {
     let mut guard = self
       .overlay
-      .lock()
+      .write()
       .map_err(|_| anyhow::anyhow!("overlay lock poisoned"))?;
     guard.merkle.insert(record.hash, Some(record));
     Ok(())
@@ -53,7 +60,7 @@ impl TreeDB for SessionDB {
   fn set_merkle_records(&mut self, records: &Vec<MerkleRecord>) -> anyhow::Result<()> {
     let mut guard = self
       .overlay
-      .lock()
+      .write()
       .map_err(|_| anyhow::anyhow!("overlay lock poisoned"))?;
     for record in records {
       guard.merkle.insert(record.hash, Some(record.clone()));
@@ -64,7 +71,7 @@ impl TreeDB for SessionDB {
   fn get_data_record(&self, hash: &[u8; 32]) -> anyhow::Result<Option<DataHashRecord>> {
     let guard = self
       .overlay
-      .lock()
+      .read()
       .map_err(|_| anyhow::anyhow!("overlay lock poisoned"))?;
     if let Some(record) = guard.data.get(hash) {
       return Ok(record.clone());
@@ -76,7 +83,7 @@ impl TreeDB for SessionDB {
   fn set_data_record(&mut self, record: DataHashRecord) -> anyhow::Result<()> {
     let mut guard = self
       .overlay
-      .lock()
+      .write()
       .map_err(|_| anyhow::anyhow!("overlay lock poisoned"))?;
     guard.data.insert(record.hash, Some(record));
     Ok(())
@@ -95,8 +102,54 @@ impl TreeDB for SessionDB {
   }
 }
 
-fn sessions() -> &'static Mutex<HashMap<String, Arc<Mutex<OverlayState>>>> {
-  SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
+impl TreeDB for BatchDB {
+  fn get_merkle_record(&self, hash: &[u8; 32]) -> anyhow::Result<Option<MerkleRecord>> {
+    if let Some(record) = self.merkle.borrow().get(hash) {
+      return Ok(Some(record.clone()));
+    }
+    self.base.get_merkle_record(hash)
+  }
+
+  fn set_merkle_record(&mut self, record: MerkleRecord) -> anyhow::Result<()> {
+    self.merkle.borrow_mut().insert(record.hash, record);
+    Ok(())
+  }
+
+  fn set_merkle_records(&mut self, records: &Vec<MerkleRecord>) -> anyhow::Result<()> {
+    let mut guard = self.merkle.borrow_mut();
+    for record in records {
+      guard.insert(record.hash, record.clone());
+    }
+    Ok(())
+  }
+
+  fn get_data_record(&self, hash: &[u8; 32]) -> anyhow::Result<Option<DataHashRecord>> {
+    if let Some(record) = self.data.borrow().get(hash) {
+      return Ok(Some(record.clone()));
+    }
+    self.base.get_data_record(hash)
+  }
+
+  fn set_data_record(&mut self, record: DataHashRecord) -> anyhow::Result<()> {
+    self.data.borrow_mut().insert(record.hash, record);
+    Ok(())
+  }
+
+  fn start_record(&mut self, _record_db: RocksDB) -> anyhow::Result<()> {
+    Err(anyhow::anyhow!("BatchDB does not support record"))
+  }
+
+  fn stop_record(&mut self) -> anyhow::Result<RocksDB> {
+    Err(anyhow::anyhow!("BatchDB does not support record"))
+  }
+
+  fn is_recording(&self) -> bool {
+    false
+  }
+}
+
+fn sessions() -> &'static RwLock<HashMap<String, Arc<RwLock<OverlayState>>>> {
+  SESSIONS.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
 fn to_bytes32(buf: &[u8]) -> napi::Result<[u8; 32]> {
@@ -127,7 +180,7 @@ fn get_db(session: Option<String>) -> napi::Result<std::rc::Rc<std::cell::RefCel
     .clone();
   if let Some(session) = session {
     let overlay = sessions()
-      .lock()
+      .read()
       .map_err(|_| napi::Error::new(Status::GenericFailure, "sessions lock poisoned"))?
       .get(&session)
       .cloned();
@@ -184,8 +237,8 @@ pub fn ping() -> bool {
 pub fn begin_session() -> String {
   let id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
   let session = format!("s{id}");
-  let overlay = Arc::new(Mutex::new(OverlayState::default()));
-  if let Ok(mut guard) = sessions().lock() {
+  let overlay = Arc::new(RwLock::new(OverlayState::default()));
+  if let Ok(mut guard) = sessions().write() {
     guard.insert(session.clone(), overlay);
   }
   session
@@ -194,7 +247,7 @@ pub fn begin_session() -> String {
 #[napi]
 pub fn drop_session(session: String) -> bool {
   sessions()
-    .lock()
+    .write()
     .ok()
     .and_then(|mut guard| guard.remove(&session))
     .is_some()
@@ -203,7 +256,7 @@ pub fn drop_session(session: String) -> bool {
 #[napi]
 pub fn reset_session(session: String) -> napi::Result<bool> {
   let overlay = sessions()
-    .lock()
+    .read()
     .map_err(|_| napi::Error::new(Status::GenericFailure, "sessions lock poisoned"))?
     .get(&session)
     .cloned();
@@ -214,7 +267,7 @@ pub fn reset_session(session: String) -> napi::Result<bool> {
     ));
   };
   let mut guard = overlay
-    .lock()
+    .write()
     .map_err(|_| napi::Error::new(Status::GenericFailure, "overlay lock poisoned"))?;
   guard.merkle.clear();
   guard.data.clear();
@@ -230,7 +283,7 @@ pub struct CommitSessionResponse {
 #[napi]
 pub fn commit_session(session: String) -> napi::Result<CommitSessionResponse> {
   let overlay = sessions()
-    .lock()
+    .read()
     .map_err(|_| napi::Error::new(Status::GenericFailure, "sessions lock poisoned"))?
     .get(&session)
     .cloned();
@@ -243,7 +296,7 @@ pub fn commit_session(session: String) -> napi::Result<CommitSessionResponse> {
 
   let (merkle, data) = {
     let mut guard = overlay
-      .lock()
+      .write()
       .map_err(|_| napi::Error::new(Status::GenericFailure, "overlay lock poisoned"))?;
     let merkle = std::mem::take(&mut guard.merkle);
     let data = std::mem::take(&mut guard.data);
@@ -361,7 +414,23 @@ pub fn apply_txs(
   session: Option<String>,
 ) -> napi::Result<Vec<Buffer>> {
   let root = to_bytes32(&root)?;
-  let db = get_db(session)?;
+  let (db, maybe_batch) = if let Some(session) = session {
+    (get_db(Some(session))?, None)
+  } else {
+    let base = DB
+      .get()
+      .ok_or_else(|| napi::Error::new(Status::GenericFailure, "merkle db not opened"))?
+      .clone();
+    let merkle = std::rc::Rc::new(std::cell::RefCell::new(HashMap::new()));
+    let data = std::rc::Rc::new(std::cell::RefCell::new(HashMap::new()));
+    let db = std::rc::Rc::new(std::cell::RefCell::new(BatchDB {
+      base: base.clone(),
+      merkle: merkle.clone(),
+      data: data.clone(),
+    })) as std::rc::Rc<std::cell::RefCell<dyn TreeDB>>;
+    (db, Some((base, merkle, data)))
+  };
+
   let mut mongo_datahash = MongoDataHash::construct([0; 32], Some(db.clone()));
   let mut mt = MongoMerkle::<MERKLE_DEPTH>::construct([0; 32], root, Some(db));
 
@@ -388,6 +457,20 @@ pub fn apply_txs(
     roots.push(Buffer::from(mt.get_root_hash().to_vec()));
   }
 
+  if let Some((mut base, merkle, data)) = maybe_batch {
+    let merkle_records: Vec<MerkleRecord> =
+      std::mem::take(&mut *merkle.borrow_mut()).into_values().collect();
+    let data_records: Vec<DataHashRecord> = std::mem::take(&mut *data.borrow_mut()).into_values().collect();
+    base
+      .set_merkle_records(&merkle_records)
+      .map_err(|e| napi::Error::new(Status::GenericFailure, format!("{e}")))?;
+    for record in data_records {
+      base
+        .set_data_record(record)
+        .map_err(|e| napi::Error::new(Status::GenericFailure, format!("{e}")))?;
+    }
+  }
+
   Ok(roots)
 }
 
@@ -398,7 +481,23 @@ pub fn apply_txs_final(
   session: Option<String>,
 ) -> napi::Result<Buffer> {
   let root = to_bytes32(&root)?;
-  let db = get_db(session)?;
+  let (db, maybe_batch) = if let Some(session) = session {
+    (get_db(Some(session))?, None)
+  } else {
+    let base = DB
+      .get()
+      .ok_or_else(|| napi::Error::new(Status::GenericFailure, "merkle db not opened"))?
+      .clone();
+    let merkle = std::rc::Rc::new(std::cell::RefCell::new(HashMap::new()));
+    let data = std::rc::Rc::new(std::cell::RefCell::new(HashMap::new()));
+    let db = std::rc::Rc::new(std::cell::RefCell::new(BatchDB {
+      base: base.clone(),
+      merkle: merkle.clone(),
+      data: data.clone(),
+    })) as std::rc::Rc<std::cell::RefCell<dyn TreeDB>>;
+    (db, Some((base, merkle, data)))
+  };
+
   let mut mongo_datahash = MongoDataHash::construct([0; 32], Some(db.clone()));
   let mut mt = MongoMerkle::<MERKLE_DEPTH>::construct([0; 32], root, Some(db));
 
@@ -418,6 +517,20 @@ pub fn apply_txs_final(
       let index = parse_u64_decimal(&w.index, "index")?;
       let data = to_bytes32(&w.data)?;
       mt.update_leaf_data_with_proof(index, &data.to_vec())
+        .map_err(|e| napi::Error::new(Status::GenericFailure, format!("{e}")))?;
+    }
+  }
+
+  if let Some((mut base, merkle, data)) = maybe_batch {
+    let merkle_records: Vec<MerkleRecord> =
+      std::mem::take(&mut *merkle.borrow_mut()).into_values().collect();
+    let data_records: Vec<DataHashRecord> = std::mem::take(&mut *data.borrow_mut()).into_values().collect();
+    base
+      .set_merkle_records(&merkle_records)
+      .map_err(|e| napi::Error::new(Status::GenericFailure, format!("{e}")))?;
+    for record in data_records {
+      base
+        .set_data_record(record)
         .map_err(|e| napi::Error::new(Status::GenericFailure, format!("{e}")))?;
     }
   }
