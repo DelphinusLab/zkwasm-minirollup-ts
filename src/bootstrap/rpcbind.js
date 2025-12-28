@@ -2,6 +2,8 @@ import requestMerkleData from './syncrpc.cjs';
 let url = 'http://127.0.0.1:3030';
 import dotenv from 'dotenv';
 import { createRequire } from 'node:module';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 dotenv.config();
 
 // Load environment variables from .env file
@@ -14,11 +16,79 @@ console.log("rpc bind merkle server:", url);
 const MERKLE_RPC_MODE = process.env.MERKLE_RPC_MODE ?? 'syncproc';
 const require = createRequire(import.meta.url);
 let syncFetch;
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+let merkleNative;
+let merkleNativeOpened = false;
+const MERKLE_NATIVE_ADDON_PATH = path.join(
+  __dirname,
+  '../../native/merkle-native/merkle_native.node',
+);
+
+function getMerkleDbUri() {
+  return process.env.MERKLE_DB_URI ?? process.env.MERKLE_DB_PATH ?? process.env.MERKLE_DB ?? '';
+}
+
+function ensureMerkleNativeOpen() {
+  if (merkleNativeOpened) return;
+  const uri = getMerkleDbUri();
+  if (!uri) {
+    throw new Error('MERKLE_DB_URI is required when MERKLE_RPC_MODE=native');
+  }
+  if (!merkleNative) {
+    try {
+      merkleNative = require(MERKLE_NATIVE_ADDON_PATH);
+    } catch (e) {
+      throw new Error(
+        `failed to load merkle native addon at ${MERKLE_NATIVE_ADDON_PATH}: ${e instanceof Error ? e.message : String(e)}`,
+      );
+    }
+  }
+  merkleNative.open(uri);
+  merkleNativeOpened = true;
+}
+
+function bytes32ToBuffer(value, name) {
+  if (Buffer.isBuffer(value)) {
+    if (value.length !== 32) throw new Error(`${name} expected 32 bytes, got ${value.length}`);
+    return value;
+  }
+  if (value instanceof Uint8Array) {
+    if (value.length !== 32) throw new Error(`${name} expected 32 bytes, got ${value.length}`);
+    return Buffer.from(value);
+  }
+  if (Array.isArray(value)) {
+    if (value.length !== 32) throw new Error(`${name} expected 32 bytes, got ${value.length}`);
+    return Buffer.from(value);
+  }
+  throw new Error(`${name} must be Uint8Array/Buffer/number[32], got ${typeof value}`);
+}
+
+function normalizeTxsForNative(txs) {
+  if (!Array.isArray(txs)) return [];
+  return txs.map((tx) => ({
+    writes: Array.isArray(tx?.writes)
+      ? tx.writes.map((w) => ({
+          index: w.index,
+          data: bytes32ToBuffer(w.data, 'write.data'),
+        }))
+      : [],
+    updateRecords: Array.isArray(tx?.updateRecords)
+      ? tx.updateRecords.map((r) => ({
+          hash: bytes32ToBuffer(r.hash, 'updateRecord.hash'),
+          data: r.data,
+        }))
+      : [],
+  }));
+}
 
 function requestMerkle(requestData) {
   if (MERKLE_RPC_MODE === 'mock') {
     let result;
     switch (requestData?.method) {
+      case 'ping':
+        result = true;
+        break;
       case 'get_leaf':
         result = { leaf: requestData?.params?.index };
         break;
@@ -125,6 +195,15 @@ function bigintArray2array(hash) {
 }
 
 function async_get_leaf(root, index) {
+  if (MERKLE_RPC_MODE === 'native') {
+    ensureMerkleNativeOpen();
+    const leaf = merkleNative.getLeaf(
+      bytes32ToBuffer(root, 'root'),
+      index.toString(),
+      getMerkleSession(),
+    );
+    return leaf;
+  }
   let roothash = hash2array(root);
   const requestData = {
     jsonrpc: '2.0',
@@ -170,6 +249,16 @@ export function get_leaf(root, index) {
 }
 
 function async_update_leaf(root, index, data) {
+  if (MERKLE_RPC_MODE === 'native') {
+    ensureMerkleNativeOpen();
+    const nextRoot = merkleNative.updateLeaf(
+      bytes32ToBuffer(root, 'root'),
+      index.toString(),
+      bytes32ToBuffer(data, 'data'),
+      getMerkleSession(),
+    );
+    return nextRoot;
+  }
   let roothash = hash2array(root);
   let datahash = hash2array(data);
   const requestData = {
@@ -215,6 +304,15 @@ export function update_leaf(root, index, data) {
 }
 
 function async_update_record(hash, data) {
+  if (MERKLE_RPC_MODE === 'native') {
+    ensureMerkleNativeOpen();
+    merkleNative.updateRecord(
+      bytes32ToBuffer(hash, 'hash'),
+      bigintArray2array(data),
+      getMerkleSession(),
+    );
+    return null;
+  }
   let roothash = hash2array(hash);
   let datavec = bigintArray2array(data);
   const requestData = {
@@ -259,6 +357,15 @@ export function update_record(hash, data) {
 }
 
 function async_apply_txs(root, txs) {
+  if (MERKLE_RPC_MODE === 'native') {
+    ensureMerkleNativeOpen();
+    const roots = merkleNative.applyTxs(
+      bytes32ToBuffer(root, 'root'),
+      normalizeTxsForNative(txs),
+      getMerkleSession(),
+    );
+    return roots.map((r) => hash2array(r));
+  }
   let roothash = hash2array(root);
   const requestData = {
     jsonrpc: '2.0',
@@ -286,6 +393,15 @@ export function apply_txs(root, txs) {
 }
 
 function async_apply_txs_final(root, txs) {
+  if (MERKLE_RPC_MODE === 'native') {
+    ensureMerkleNativeOpen();
+    const finalRoot = merkleNative.applyTxsFinal(
+      bytes32ToBuffer(root, 'root'),
+      normalizeTxsForNative(txs),
+      getMerkleSession(),
+    );
+    return hash2array(finalRoot);
+  }
   let roothash = hash2array(root);
   const requestData = {
     jsonrpc: '2.0',
@@ -313,6 +429,15 @@ export function apply_txs_final(root, txs) {
 }
 
 export async function apply_txs_async(root, txs) {
+  if (MERKLE_RPC_MODE === 'native') {
+    ensureMerkleNativeOpen();
+    const roots = merkleNative.applyTxs(
+      bytes32ToBuffer(root, 'root'),
+      normalizeTxsForNative(txs),
+      getMerkleSession(),
+    );
+    return roots.map((r) => hash2array(r));
+  }
   let roothash = hash2array(root);
   const requestData = {
     jsonrpc: '2.0',
@@ -330,6 +455,15 @@ export async function apply_txs_async(root, txs) {
 }
 
 export async function apply_txs_final_async(root, txs) {
+  if (MERKLE_RPC_MODE === 'native') {
+    ensureMerkleNativeOpen();
+    const finalRoot = merkleNative.applyTxsFinal(
+      bytes32ToBuffer(root, 'root'),
+      normalizeTxsForNative(txs),
+      getMerkleSession(),
+    );
+    return hash2array(finalRoot);
+  }
   let roothash = hash2array(root);
   const requestData = {
     jsonrpc: '2.0',
@@ -347,6 +481,11 @@ export async function apply_txs_final_async(root, txs) {
 }
 
 function async_get_record(hash) {
+  if (MERKLE_RPC_MODE === 'native') {
+    ensureMerkleNativeOpen();
+    const out = merkleNative.getRecord(bytes32ToBuffer(hash, 'hash'), getMerkleSession());
+    return out.map((x) => BigInt(x));
+  }
   let hasharray = hash2array(hash);
   const requestData = {
     jsonrpc: '2.0',
@@ -397,6 +536,10 @@ export function get_record(hash) {
 }
 
 export function begin_session() {
+  if (MERKLE_RPC_MODE === 'native') {
+    ensureMerkleNativeOpen();
+    return merkleNative.beginSession();
+  }
   const requestData = {
     jsonrpc: '2.0',
     method: 'begin_session',
@@ -414,6 +557,10 @@ export function begin_session() {
 }
 
 export function drop_session(session) {
+  if (MERKLE_RPC_MODE === 'native') {
+    ensureMerkleNativeOpen();
+    return merkleNative.dropSession(session);
+  }
   const requestData = {
     jsonrpc: '2.0',
     method: 'drop_session',
@@ -431,6 +578,10 @@ export function drop_session(session) {
 }
 
 export function reset_session(session) {
+  if (MERKLE_RPC_MODE === 'native') {
+    ensureMerkleNativeOpen();
+    return merkleNative.resetSession(session);
+  }
   const requestData = {
     jsonrpc: '2.0',
     method: 'reset_session',
@@ -448,6 +599,14 @@ export function reset_session(session) {
 }
 
 export function commit_session(session) {
+  if (MERKLE_RPC_MODE === 'native') {
+    ensureMerkleNativeOpen();
+    const result = merkleNative.commitSession(session);
+    return {
+      merkle_records: result?.merkleRecords ?? 0,
+      data_records: result?.dataRecords ?? 0,
+    };
+  }
   const requestData = {
     jsonrpc: '2.0',
     method: 'commit_session',
@@ -462,4 +621,26 @@ export function commit_session(session) {
     console.error('Failed to commit_session:', response.error);
     throw new Error('Failed to commit_session');
   }
+}
+
+export function ping() {
+  if (MERKLE_RPC_MODE === 'native') {
+    ensureMerkleNativeOpen();
+    return merkleNative.ping();
+  }
+  if (MERKLE_RPC_MODE === 'mock') {
+    return true;
+  }
+  const requestData = {
+    jsonrpc: '2.0',
+    method: 'ping',
+    params: {},
+    id: 123,
+  };
+  const responseStr = requestMerkle(requestData);
+  const response = JSON.parse(responseStr);
+  if (response.error == undefined) {
+    return response.result;
+  }
+  throw new Error(`Failed to ping merkle service: ${JSON.stringify(response.error)}`);
 }

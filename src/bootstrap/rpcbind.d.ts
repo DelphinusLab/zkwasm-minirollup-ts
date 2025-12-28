@@ -44,3 +44,4 @@ export function begin_session(): string;
 export function drop_session(session: string): boolean;
 export function reset_session(session: string): boolean;
 export function commit_session(session: string): { merkle_records: number; data_records: number };
+export function ping(): boolean;
