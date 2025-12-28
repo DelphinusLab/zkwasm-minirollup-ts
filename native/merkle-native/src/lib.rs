@@ -89,6 +89,17 @@ impl TreeDB for SessionDB {
     Ok(())
   }
 
+  fn set_data_records(&mut self, records: &Vec<DataHashRecord>) -> anyhow::Result<()> {
+    let mut guard = self
+      .overlay
+      .write()
+      .map_err(|_| anyhow::anyhow!("overlay lock poisoned"))?;
+    for record in records {
+      guard.data.insert(record.hash, Some(record.clone()));
+    }
+    Ok(())
+  }
+
   fn start_record(&mut self, _record_db: RocksDB) -> anyhow::Result<()> {
     Err(anyhow::anyhow!("SessionDB does not support record"))
   }
@@ -132,6 +143,14 @@ impl TreeDB for BatchDB {
 
   fn set_data_record(&mut self, record: DataHashRecord) -> anyhow::Result<()> {
     self.data.borrow_mut().insert(record.hash, record);
+    Ok(())
+  }
+
+  fn set_data_records(&mut self, records: &Vec<DataHashRecord>) -> anyhow::Result<()> {
+    let mut guard = self.data.borrow_mut();
+    for record in records {
+      guard.insert(record.hash, record.clone());
+    }
     Ok(())
   }
 
@@ -313,11 +332,9 @@ pub fn commit_session(session: String) -> napi::Result<CommitSessionResponse> {
   base
     .set_merkle_records(&merkle_records)
     .map_err(|e| napi::Error::new(Status::GenericFailure, format!("{e}")))?;
-  for record in data_records.iter().cloned() {
-    base
-      .set_data_record(record)
-      .map_err(|e| napi::Error::new(Status::GenericFailure, format!("{e}")))?;
-  }
+  base
+    .set_data_records(&data_records)
+    .map_err(|e| napi::Error::new(Status::GenericFailure, format!("{e}")))?;
 
   Ok(CommitSessionResponse {
     merkle_records: merkle_records.len() as u32,
@@ -460,15 +477,14 @@ pub fn apply_txs(
   if let Some((mut base, merkle, data)) = maybe_batch {
     let merkle_records: Vec<MerkleRecord> =
       std::mem::take(&mut *merkle.borrow_mut()).into_values().collect();
-    let data_records: Vec<DataHashRecord> = std::mem::take(&mut *data.borrow_mut()).into_values().collect();
+    let data_records: Vec<DataHashRecord> =
+      std::mem::take(&mut *data.borrow_mut()).into_values().collect();
     base
       .set_merkle_records(&merkle_records)
       .map_err(|e| napi::Error::new(Status::GenericFailure, format!("{e}")))?;
-    for record in data_records {
-      base
-        .set_data_record(record)
-        .map_err(|e| napi::Error::new(Status::GenericFailure, format!("{e}")))?;
-    }
+    base
+      .set_data_records(&data_records)
+      .map_err(|e| napi::Error::new(Status::GenericFailure, format!("{e}")))?;
   }
 
   Ok(roots)
@@ -524,15 +540,14 @@ pub fn apply_txs_final(
   if let Some((mut base, merkle, data)) = maybe_batch {
     let merkle_records: Vec<MerkleRecord> =
       std::mem::take(&mut *merkle.borrow_mut()).into_values().collect();
-    let data_records: Vec<DataHashRecord> = std::mem::take(&mut *data.borrow_mut()).into_values().collect();
+    let data_records: Vec<DataHashRecord> =
+      std::mem::take(&mut *data.borrow_mut()).into_values().collect();
     base
       .set_merkle_records(&merkle_records)
       .map_err(|e| napi::Error::new(Status::GenericFailure, format!("{e}")))?;
-    for record in data_records {
-      base
-        .set_data_record(record)
-        .map_err(|e| napi::Error::new(Status::GenericFailure, format!("{e}")))?;
-    }
+    base
+      .set_data_records(&data_records)
+      .map_err(|e| napi::Error::new(Status::GenericFailure, format!("{e}")))?;
   }
 
   Ok(Buffer::from(mt.get_root_hash().to_vec()))
