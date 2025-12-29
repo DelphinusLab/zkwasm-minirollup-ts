@@ -1,5 +1,16 @@
 import mongoose from 'mongoose';
 import { TxWitness } from './prover.js';
+
+const ASYNC_COMMIT_WRITES = process.env.ASYNC_COMMIT_WRITES === '1';
+const BATCH_COMMIT_WRITES = process.env.BATCH_COMMIT_WRITES === '1';
+const COMMIT_BATCH_SIZE = Number.parseInt(process.env.COMMIT_BATCH_SIZE ?? "200", 10);
+const COMMIT_FLUSH_MS = Number.parseInt(process.env.COMMIT_FLUSH_MS ?? "50", 10);
+const COMMIT_BATCH_FATAL = process.env.COMMIT_BATCH_FATAL === '1';
+
+function clampPositiveInt(value: number, fallback: number): number {
+  if (!Number.isFinite(value) || value <= 0) return fallback;
+  return Math.floor(value);
+}
 const txSchema = new mongoose.Schema({
   msg: { type: String, required: true },
   pkx: { type: String, required: true },
@@ -36,6 +47,13 @@ const ensureIndexes = async () => {
       console.log('Index on key field already exists');
     }
   } catch (error) {
+    const mongoErr = error as any;
+    if (mongoErr?.code === 26 || mongoErr?.codeName === 'NamespaceNotFound') {
+      console.log('Creating index on key field for new database...');
+      await CommitModel.collection.createIndex({ key: 1 });
+      console.log('Index on key field created successfully');
+      return;
+    }
     console.error('Error ensuring indexes:', error);
   }
 };
@@ -47,6 +65,10 @@ export class TxStateManager {
     currentUncommitMerkleRoot: string;
     uncommittedTxs: TxWitness[];
     preemptcounter: number;
+
+    private pendingWrites: Array<{ key: string; tx: TxWitness }> = [];
+    private flushTimer: ReturnType<typeof setTimeout> | null = null;
+    private flushInFlight: Promise<void> | null = null;
 
     constructor(merkleRootHexString: string) {
       this.currentUncommitMerkleRoot = merkleRootHexString;
@@ -100,10 +122,12 @@ export class TxStateManager {
 
 
     async moveToCommit(key: string) {
-      this.currentUncommitMerkleRoot = key;
-      this.preemptcounter = 0;
-      this.uncommittedTxs = [];
       try {
+        await this.flushPending("moveToCommit");
+
+        this.currentUncommitMerkleRoot = key;
+        this.preemptcounter = 0;
+        this.uncommittedTxs = [];
         await CommitModel.findOneAndUpdate({
           key: key
         }, {
@@ -118,37 +142,103 @@ export class TxStateManager {
       }
     }
 
-    async insertTxIntoCommit (tx: TxWitness): Promise<boolean>{
-      const counter = this.preemptcounter;
+    async insertTxIntoCommit (tx: TxWitness, isReplay = false): Promise<boolean>{
       const key = this.currentUncommitMerkleRoot;
       this.preemptcounter += 1;
+      if (isReplay) {
+        return true;
+      }
       try {
-        const commit = await CommitModel.findOne({ key });
-        console.log(`Inserting tx into bundle with key: ${key}`);
-        if (commit) {
-          // If key exists, push new item to items array
-          if (commit.items.length <= counter) {
-            commit.items.push(tx);
-            await commit.save();
-            return false; // new tx, needs track
+        if (BATCH_COMMIT_WRITES) {
+          this.pendingWrites.push({ key, tx });
+          const batchSize = clampPositiveInt(COMMIT_BATCH_SIZE, 200);
+          if (this.pendingWrites.length >= batchSize) {
+            const flush = this.flushPending("batch_full");
+            if (ASYNC_COMMIT_WRITES) {
+              void flush;
+            } else {
+              await flush;
+            }
           } else {
-            let trackedTx = commit.items[counter];
-            console.assert(tx.sigx == trackedTx.sigx);
-            return true; // event already tracked
+            this.scheduleFlush();
           }
         } else {
-          // If key does not exist, create a new commit record
-          const newCommit = new CommitModel({
-            key,
-            items: [tx], // Insert the new item as the first element
-          });
-          await newCommit.save();
-          return false;
+          const write = CommitModel.findOneAndUpdate(
+              { key },
+              { $setOnInsert: { key }, $push: { items: tx } },
+              { upsert: true }
+          );
+          if (ASYNC_COMMIT_WRITES) {
+            void write.catch((error) => {
+              console.error('Error inserting tx into current bundle:', error);
+            });
+          } else {
+            await write;
+          }
         }
+        return false; // new tx, needs track
       } catch (error) {
         console.error('Error inserting tx into current bundle:', error);
         throw (error)
       }
     };
-}
 
+    async flushPending(reason = "manual") {
+      if (!BATCH_COMMIT_WRITES) return;
+      if (this.flushTimer) {
+        clearTimeout(this.flushTimer);
+        this.flushTimer = null;
+      }
+
+      if (this.flushInFlight) {
+        await this.flushInFlight;
+        if (this.pendingWrites.length === 0) return;
+      }
+
+      this.flushInFlight = this.flushInternal(reason)
+        .catch((error) => {
+          console.error(`Error flushing commit batch (${reason}):`, error);
+          if (COMMIT_BATCH_FATAL || !ASYNC_COMMIT_WRITES) {
+            console.error('fatal: commit batch flush failed ... process will terminate');
+            process.exit(1);
+          }
+        })
+        .finally(() => {
+          this.flushInFlight = null;
+        });
+
+      await this.flushInFlight;
+    }
+
+    private scheduleFlush() {
+      if (!BATCH_COMMIT_WRITES) return;
+      if (this.flushTimer) return;
+      const flushMs = clampPositiveInt(COMMIT_FLUSH_MS, 50);
+      this.flushTimer = setTimeout(() => {
+        this.flushTimer = null;
+        void this.flushPending("timer");
+      }, flushMs);
+    }
+
+    private async flushInternal(reason: string) {
+      const batchSize = clampPositiveInt(COMMIT_BATCH_SIZE, 200);
+      while (this.pendingWrites.length > 0) {
+        const key = this.pendingWrites[0]!.key;
+        const batch: TxWitness[] = [];
+        while (
+          this.pendingWrites.length > 0 &&
+          this.pendingWrites[0]!.key === key &&
+          batch.length < batchSize
+        ) {
+          batch.push(this.pendingWrites.shift()!.tx);
+        }
+
+        const write = CommitModel.findOneAndUpdate(
+          { key },
+          { $setOnInsert: { key }, $push: { items: { $each: batch } } },
+          { upsert: true }
+        );
+        await write;
+      }
+    }
+}
