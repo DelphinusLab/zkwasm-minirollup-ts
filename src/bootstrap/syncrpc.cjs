@@ -4,13 +4,6 @@ const ps = {
 }
 const buffer = Buffer.alloc(4096);
 
-// Prevent EAGAIN tight-loop from burning CPU.
-const SLEEP_BUF = new SharedArrayBuffer(4);
-const SLEEP_ARR = new Int32Array(SLEEP_BUF);
-function sleepMs(ms) {
-  Atomics.wait(SLEEP_ARR, 0, 0, ms);
-}
-
 function requestMerkleData(requestData) {
   if (typeof window === "undefined") {
     if (ps.process == null) {
@@ -24,27 +17,6 @@ function requestMerkleData(requestData) {
 
       ps.fs = fs;
       ps.process = exec.exec(`${process.execPath} ${path.join(__dirname, 'dbprocess.js')}`);
-      ps.process.unref();
-      ps.process.stdin?.unref?.();
-      ps.process.stdout?.unref?.();
-      ps.process.stderr?.unref?.();
-
-      const cleanup = () => {
-        try {
-          ps.process?.kill?.();
-        } catch {
-          // ignore
-        }
-      };
-      process.once('exit', cleanup);
-      process.once('SIGINT', () => {
-        cleanup();
-        process.exit(130);
-      });
-      process.once('SIGTERM', () => {
-        cleanup();
-        process.exit(143);
-      });
       //let ps = exec.exec('node /home/xgao/zkWasm-server/zkwasm-typescript-mini-server/ts/src/bootstrap/dbprocess.js');
       }
   }
@@ -63,7 +35,7 @@ function requestMerkleData(requestData) {
            //console.log("bytesRead", bytesRead);
          } catch (error) {
            if (error && (error).code === "EAGAIN") {
-             sleepMs(1);
+             //console.log("read bytes!", bytesRead);
              continue;
            } else {
              throw error; // Re-throw other errors

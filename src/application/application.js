@@ -1,9 +1,6 @@
 import { __wbg_set_wasm } from "./application_loader.js";
 import fs from "fs";
 
-const LOG_WASMDBG =
-  process.env.LOG_WASMDBG === "1" || process.env.LOG_WASMDBG === "true";
-
 let _print_buf = [];
 
 function print_result() {
@@ -11,7 +8,7 @@ function print_result() {
   const result = String.fromCharCode(..._print_buf);
 
   _print_buf = [];
-  console.log("wasmdbg:>>> ", result);
+  console.log("wasmdbg:>>> ",result);
 }
 
 const __wbg_star0 = (env) => {
@@ -29,9 +26,6 @@ const __wbg_star0 = (env) => {
       }
     },
     wasm_dbg: (c) => {
-      if (!LOG_WASMDBG) {
-        return;
-      }
       console.log("wasm_dbg", c);
     },
     wasm_trace_size: () => {
@@ -43,12 +37,10 @@ const __wbg_star0 = (env) => {
      * - Print the accumulated result when encountering a newline
      * - Append the character to the print buffer
      */
-    wasm_dbg_char: LOG_WASMDBG
-      ? (data) =>
-          String.fromCharCode(Number(data)) === "\n"
-            ? print_result()
-            : _print_buf.push(Number(data))
-      : () => {},
+    wasm_dbg_char: (data) =>
+    String.fromCharCode(Number(data)) === "\n"
+      ? print_result()
+      : _print_buf.push(Number(data)),
     wasm_input: () => {
       console.error("wasm_input should not been called in non-zkwasm mode");
       throw new Error("Unsupported wasm api: wasm_input");
@@ -107,9 +99,7 @@ function __wbg_finalize_init(instance, module) {
 
 async function __wbg_init(env, input) {
   if (wasm !== null) {
-    if (LOG_WASMDBG) {
-      console.log("reloading wasm application");
-    }
+    console.log("reloading wasm application");
   };
 
   if (typeof input === 'undefined') {
