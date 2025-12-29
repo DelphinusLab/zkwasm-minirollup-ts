@@ -197,6 +197,13 @@ fn merkle_native_timing_enabled() -> bool {
   matches!(std::env::var("MERKLE_NATIVE_TIMING").as_deref(), Ok("1"))
 }
 
+fn merkle_native_parallel_enabled() -> bool {
+  matches!(
+    std::env::var("MERKLE_NATIVE_PARALLEL").as_deref(),
+    Ok("1") | Ok("true")
+  )
+}
+
 fn get_db(session: Option<String>) -> napi::Result<std::rc::Rc<std::cell::RefCell<dyn TreeDB>>> {
   let db = DB
     .get()
@@ -526,6 +533,7 @@ pub fn apply_txs_final(
   session: Option<String>,
 ) -> napi::Result<Buffer> {
   let timing = merkle_native_timing_enabled();
+  let parallel = merkle_native_parallel_enabled();
   let t_total = timing.then(Instant::now);
   let mut t_parse = DurationStats::default();
   let mut t_merkle = DurationStats::default();
@@ -579,8 +587,13 @@ pub fn apply_txs_final(
   }
 
   let t0 = timing.then(Instant::now);
-  mt.update_leaves_batch(&leaf_updates)
-    .map_err(|e| napi::Error::new(Status::GenericFailure, format!("{e}")))?;
+  if parallel {
+    mt.update_leaves_batch_parallel(&leaf_updates)
+      .map_err(|e| napi::Error::new(Status::GenericFailure, format!("{e}")))?;
+  } else {
+    mt.update_leaves_batch(&leaf_updates)
+      .map_err(|e| napi::Error::new(Status::GenericFailure, format!("{e}")))?;
+  }
   if let Some(t0) = t0 {
     t_merkle.observe(t0.elapsed());
   }
