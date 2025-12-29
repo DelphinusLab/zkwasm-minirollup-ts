@@ -1,7 +1,4 @@
 import axios from 'axios';
-import http from 'node:http';
-import https from 'node:https';
-import { URL } from 'node:url';
 let url = 'http://127.0.0.1:3030';
 if (process.env.MERKLE_SERVER) {
   url = process.env.MERKLE_SERVER;
@@ -10,29 +7,21 @@ if (process.env.MERKLE_SERVER) {
 export class MerkleServiceRpc {
   private baseUrl: string;
   private instance;
-  private agent: http.Agent | https.Agent;
 
   constructor(baseUrl: string) {
     this.baseUrl = baseUrl;
-    const parsed = new URL(baseUrl);
-    const keepAlive = process.env.MERKLE_RPC_KEEPALIVE !== '0';
-    const maxSocketsRaw = Number.parseInt(process.env.MERKLE_RPC_MAX_SOCKETS ?? "1", 10);
-    const maxSockets = Number.isFinite(maxSocketsRaw) && maxSocketsRaw > 0 ? maxSocketsRaw : 1;
-    this.agent =
-      parsed.protocol === 'https:'
-        ? new https.Agent({ keepAlive, maxSockets })
-        : new http.Agent({ keepAlive, maxSockets });
     this.instance = axios.create({
       baseURL: this.baseUrl,
-      headers: { 'Content-Type': 'application/json' },
-      httpAgent: this.agent,
-      httpsAgent: this.agent,
+      headers: { 'Content-Type': 'application/json' }
     });
   }
 
-  public async queryDB(request: any): Promise<any> {
+  public async queryDB(request: any): Promise<void> {
     try {
-      const response = await this.instance.post("", request);
+      const response = await this.instance.post(
+        "",
+        JSON.stringify(request)
+      );
       if (response.status === 200) {
         return response.data
       } else {

@@ -1,7 +1,0 @@
-node_modules
-*.map
-src/*.js
-src/**/*.js
-src/**/*.js.map
-native/**/target
-native/**/*.node

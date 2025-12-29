@@ -219,15 +219,7 @@ export async function has_task(): Promise<boolean> {
     taskstatus: "",
     total: 1,
   };
-  try {
-    let tasks = await helper.loadTasks(query);
-    console.log(tasks);
-    return tasks.data.length > 0;
-  } catch (error: any) {
-    if (process.env.STRICT_REMOTE === '1') {
-      throw error;
-    }
-    console.warn("has_task: remote unavailable, falling back to local mode:", error?.message ?? error);
-    return false;
-  }
+  let tasks = await helper.loadTasks(query);
+  console.log(tasks);
+  return tasks.data.length > 0;
 }

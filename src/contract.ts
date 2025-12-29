@@ -1,11 +1,7 @@
 import BN from "bn.js";
 import { ethers } from "ethers";
-import fs from "fs";
 import { get_contract_addr, get_rpc_provider} from "./config.js";
-
-const abiData = JSON.parse(
-  fs.readFileSync(new URL("./Proxy.json", import.meta.url), "utf8")
-);
+import abiData from './Proxy.json' assert { type: 'json' };
 
 export let provider = new ethers.JsonRpcProvider(get_rpc_provider());
 
@@ -64,3 +60,4 @@ export async function getMerkle(): Promise<String>{
   console.log("Old Merkle Root(string):", oldRootBeString);
   return oldRootBeString;
 }
+

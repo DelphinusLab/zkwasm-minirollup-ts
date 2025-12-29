@@ -1,6 +1,5 @@
 import fetch from 'sync-fetch';
 import { LeHexBN } from "zkwasm-minirollup-rpc";
-import { ping as merkle_ping } from "./bootstrap/rpcbind.js";
 
 import dotenv from 'dotenv';
 dotenv.config();
@@ -13,12 +12,31 @@ if (process.env.MERKLE_SERVER) {
 }
 
 export function test_merkle_db_service() {
-  const ok = merkle_ping();
-  if (ok === true) {
-    console.log({ ok: true });
-    return;
+  const requestData = {
+    jsonrpc: '2.0',
+    method: 'get_leaf',
+    params: {
+      root: [208, 107, 182, 47, 101, 239, 49, 228, 249, 118, 179, 167, 239, 211, 131, 101, 81, 103, 108, 174, 203, 236, 108, 251, 125, 22, 81, 58, 216, 86, 46, 1],
+      index: (4294967296n).toString()
+    },
+    id: 123
+  };
+
+  const response = fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify(requestData)
+  });
+
+  if (response.ok) {
+    const jsonResponse = response.json();
+    console.log(jsonResponse);
+  } else {
+    console.error('Failed to fetch:', response.statusText);
+    throw ("Connecting with merkel db service fail!");
   }
-  throw new Error(`Connecting with merkle db service failed: ${String(ok)}`);
 }
 
 export function test_signature() {
