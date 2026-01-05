@@ -2,7 +2,7 @@
 import initBootstrap, * as bootstrap from "./bootstrap/bootstrap.js";
 import initApplication, * as application from "./application/application.js";
 import { test_merkle_db_service } from "./test.js";
-import { verifySign, LeHexBN, sign, PlayerConvention, ZKWasmAppRpc, createCommand } from "zkwasm-minirollup-rpc";
+import { LeHexBN, sign, PlayerConvention, ZKWasmAppRpc, createCommand } from "zkwasm-minirollup-rpc";
 import { Queue, Worker, Job } from 'bullmq';
 import IORedis from 'ioredis';
 import express, {Express} from 'express';
@@ -613,27 +613,26 @@ export class Service {
       }
 
       try {
-        const hash = new LeHexBN(value.hash);
-        const pkx = new LeHexBN(value.pkx);
-        const pky = new LeHexBN(value.pky);
-        const sigx = new LeHexBN(value.sigx);
-        const sigy = new LeHexBN(value.sigy);
-        const sigr = new LeHexBN(value.sigr);
-        if (verifySign(hash, pkx, pky, sigx, sigy, sigr) == false) {
-          console.error('Invalid signature:');
-          res.status(500).send('Invalid signature');
-        } else {
-          const fc = this.blocklist.get(value.pkx) || 0;
-          if (fc > 3) {
-            res.status(500).send('This account is blocked for 1 minutes for multiple incorrect arguments');
-          } else {
-            const job = await this.queue!.add('transaction', { value });
-            res.status(201).send({
-              success: true,
-              jobid: job.id
-            });
-          }
+        try {
+          const u64array = signature_to_u64array(value);
+          application.verify_tx_signature(u64array);
+        } catch (err) {
+          console.error('Invalid signature:', err);
+          return res.status(500).send('Invalid signature');
         }
+
+        const fc = this.blocklist.get(value.pkx) || 0;
+        if (fc > 3) {
+          return res
+            .status(500)
+            .send('This account is blocked for 1 minutes for multiple incorrect arguments');
+        }
+
+        const job = await this.queue!.add('transaction', { value });
+        return res.status(201).send({
+          success: true,
+          jobid: job.id
+        });
       } catch (error) {
         console.error('Error adding job to the queue:', error);
         res.status(500).send('Failed to add job to the queue');
