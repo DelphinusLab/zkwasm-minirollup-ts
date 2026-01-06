@@ -3,13 +3,19 @@ import initBootstrap, * as bootstrap from "./bootstrap/bootstrap.js";
 import initApplication, * as application from "./application/application.js";
 import { test_merkle_db_service } from "./test.js";
 import { verifySign, LeHexBN, sign, PlayerConvention, ZKWasmAppRpc, createCommand } from "zkwasm-minirollup-rpc";
-import { Queue, Worker, Job } from 'bullmq';
+import { Queue, Worker as BullWorker, Job } from 'bullmq';
 import IORedis from 'ioredis';
 import express, {Express} from 'express';
-import { submitProofWithRetry, has_uncomplete_task, TxWitness, get_latest_proof, has_task } from "./prover.js";
+import { has_uncomplete_task, TxWitness, get_latest_proof, has_task } from "./prover.js";
+import { Worker } from 'worker_threads';
+import { fileURLToPath } from 'url';
+import { dirname, join } from 'path';
 import { ensureIndexes } from "./commit.js";
 import cors from "cors";
-import { get_mongoose_db, modelBundle, modelJob, modelRand, get_service_port, get_server_admin_key, modelTx, get_contract_addr, get_chain_id } from "./config.js";
+import { get_mongoose_db, modelJob, modelRand, get_service_port, get_server_admin_key, modelTx, get_contract_addr, get_chain_id, get_image_md5 } from "./config.js";
+import { GlobalBundleService } from "./services/global-bundle-service.js";
+import { StateSnapshotService } from "./services/state-snapshot-service.js";
+import { StateMigrationService } from "./services/migration-service.js";
 import { getMerkleArray } from "./contract.js";
 import { ZkWasmUtil } from "zkwasm-service-helper";
 import dotenv from 'dotenv';
@@ -18,6 +24,7 @@ import {hexStringToMerkleRoot, merkleRootToBeHexString} from "./lib.js";
 import {sha256} from "ethers";
 import {TxStateManager} from "./commit.js";
 import {queryAccounts, storeAccount} from "./account.js";
+import {decodeWithdraw} from "./convention.js";
 
 // Load environment variables from .env file
 dotenv.config();
@@ -93,17 +100,23 @@ async function generateRandomSeed() {
 }
 
 export class Service {
-  worker: null | Worker;
+  worker: null | BullWorker;
   queue: null | Queue;
   txCallback: (arg: TxWitness, events: BigUint64Array) => Promise<void>;
   txBatched: (arg: TxWitness[], preMerkleHexRoot: string, postMerkleRoot: string ) => Promise<void>;
   playerIndexer: (arg: any) => number;
   registerAPICallback: (app: Express) => void;
   merkleRoot: BigUint64Array;
+  latestSubmittedBundleMerkle: BigUint64Array;
   bundleIndex: number;
   preMerkleRoot: BigUint64Array | null;
   txManager: TxStateManager;
   blocklist: Map<string, number>;
+  globalBundleService: GlobalBundleService;
+  currentMD5: string;
+  stateSnapshotService: StateSnapshotService;
+  migrationService: StateMigrationService;
+  proofWorker: Worker | null;
 
   constructor(
       cb: (arg: TxWitness, events: BigUint64Array) => Promise<void> = async (arg: TxWitness, events: BigUint64Array) => {},
@@ -123,17 +136,28 @@ export class Service {
       10309858136294505219n,
       2839580074036780766n,
     ]);
+    this.latestSubmittedBundleMerkle = this.merkleRoot;
     this.bundleIndex = 0;
     this.preMerkleRoot = null;
     this.txManager = new TxStateManager(merkleRootToBeHexString(this.merkleRoot));
     this.blocklist = new Map();
+    
+    // Initialize global Bundle service, state snapshot service and migration service
+    this.currentMD5 = get_image_md5();
+    this.globalBundleService = new GlobalBundleService();
+    this.stateSnapshotService = new StateSnapshotService(
+      merkleRootToBeHexString(this.merkleRoot)
+    );
+    this.migrationService = new StateMigrationService();
+    this.proofWorker = null;
   }
 
-  async syncToLatestMerkelRoot() {
+  async syncToLatestMerkleRoot() {
     let currentMerkle = merkleRootToBeHexString(this.merkleRoot);
     let prevMerkle = null;
     let bundle = await this.findBundleByMerkle(currentMerkle);
-    while (bundle != null && bundle.postMerkleRoot != null) {
+    // Check postMerkleRoot is non-null AND non-empty string to avoid BigInt('') error
+    while (bundle != null && bundle.postMerkleRoot && bundle.postMerkleRoot !== "") {
       const postMerkle = new BigUint64Array(hexStringToMerkleRoot(bundle.postMerkleRoot));
       console.log("sync merkle:", currentMerkle, "taskId:", bundle.taskId);
       bundle = await this.findBundleByMerkle(merkleRootToBeHexString(postMerkle));
@@ -141,31 +165,28 @@ export class Service {
         currentMerkle = bundle.merkleRoot;
         prevMerkle = bundle.preMerkleRoot;
         this.bundleIndex += 1;
+        // Update latestSubmittedBundleMerkle when bundle has been proven (has taskId)
+        if (bundle.taskId && bundle.taskId !== "") {
+          this.latestSubmittedBundleMerkle = new BigUint64Array(hexStringToMerkleRoot(currentMerkle));
+        }
       }
     }
     console.log("final merkle:", currentMerkle);
     this.merkleRoot = new BigUint64Array(hexStringToMerkleRoot(currentMerkle));
     if (prevMerkle) {
       this.preMerkleRoot = new BigUint64Array(hexStringToMerkleRoot(prevMerkle));
-
     }
   }
 
   async findBundleByMerkle(merkleHexRoot: string) {
-    const prevBundle = await modelBundle.findOne(
-      {
-        merkleRoot: merkleHexRoot
-      },
-    );
+    const prevBundle = await this.globalBundleService.findBundleByMerkle(merkleHexRoot);
     return prevBundle;
   }
 
   async findBundleIndex(merkleRoot: BigUint64Array) {
       try {
-        const prevBundle = await modelBundle.findOne(
-          {
-            merkleRoot: merkleRootToBeHexString(merkleRoot),
-          },
+        const prevBundle = await this.globalBundleService.findBundleByMerkle(
+          merkleRootToBeHexString(merkleRoot)
         );
         if (prevBundle != null) {
           return prevBundle!.bundleIndex;
@@ -178,23 +199,29 @@ export class Service {
       }
   }
 
-  async trackBundle(taskId: string) {
-    console.log("track bundle:", this.bundleIndex);
+  async trackBundle(taskId: string, txdata?: Uint8Array) {
+    console.log("Tracking bundle in global registry:", this.bundleIndex);
     let preMerkleRootStr = "";
+    // if this.preMerkleRoot == null ==> means this is the first bundle
     if (this.preMerkleRoot != null) {
       preMerkleRootStr = merkleRootToBeHexString(this.preMerkleRoot);
       console.log("update merkle chain ...", preMerkleRootStr);
       try {
-        const prevBundle = await modelBundle.findOneAndUpdate({
-          merkleRoot: merkleRootToBeHexString(this.preMerkleRoot),
-        }, {
-          postMerkleRoot: merkleRootToBeHexString(this.merkleRoot),
-        }, {});
+        const prevBundle = await this.globalBundleService.findBundleByMerkle(preMerkleRootStr);
+        if (!prevBundle) {
+          throw Error(`fatal: can not find bundle for previous MerkleRoot: ${preMerkleRootStr}`);
+        }
+        
         if (this.bundleIndex != prevBundle!.bundleIndex) {
           console.log(`fatal: bundleIndex does not match: ${this.bundleIndex}, ${prevBundle!.bundleIndex}`);
           throw Error(`Bundle Index does not match: current index is ${this.bundleIndex}, previous index is ${prevBundle!.bundleIndex}`);
         }
         console.log("merkle chain prev is", prevBundle);
+        
+        // Update chain relationships in global Bundle registry
+        await this.globalBundleService.updateBundle(preMerkleRootStr, {
+          postMerkleRoot: merkleRootToBeHexString(this.merkleRoot)
+        });
       } catch (e) {
         console.log(`fatal: can not find bundle for previous MerkleRoot: ${merkleRootToBeHexString(this.preMerkleRoot)}`);
         throw Error(`fatal: can not find bundle for previous MerkleRoot: ${merkleRootToBeHexString(this.preMerkleRoot)}`);
@@ -202,31 +229,39 @@ export class Service {
     }
     this.bundleIndex += 1;
     console.log("add transaction bundle:", this.bundleIndex, merkleRootToBeHexString(this.merkleRoot));
-    const bundleRecord = new modelBundle({
-      merkleRoot: merkleRootToBeHexString(this.merkleRoot),
-      preMerkleRoot: preMerkleRootStr,
-      taskId: taskId,
-      bundleIndex: this.bundleIndex,
-    });
+    
+    // Store raw txdata for later parsing
+    console.log(`Storing txdata of length: ${txdata ? txdata.length : 0} bytes`);
+    
     try {
-      await bundleRecord.save();
-      console.log(`task recorded with key: ${merkleRootToBeHexString(this.merkleRoot)}`);
-    }
-    catch (e) {
-      let record = await modelBundle.findOneAndUpdate({
+      // Store to global Bundle registry with raw txdata as Buffer
+      await this.globalBundleService.createBundle({
         merkleRoot: merkleRootToBeHexString(this.merkleRoot),
-      }, {
-        taskId: taskId,
-        postMerkleRoot: "",
         preMerkleRoot: preMerkleRootStr,
+        postMerkleRoot: '',
+        taskId: taskId,
         bundleIndex: this.bundleIndex,
-      }, {});
-      console.log("fatal: conflict db merkle");
-      // TODO: do we need to trim the corrputed branch?
-      console.log(record);
-      //throw e
+        settleStatus: 'waiting',
+        settleTxHash: '',
+        txdata: txdata ? Buffer.from(txdata) : null
+      }, this.currentMD5);
+      
+      console.log(`Bundle tracked globally for MD5: ${this.currentMD5}`);
+    } catch (e) {
+      // Handle conflicts in global registry
+      try {
+        await this.globalBundleService.updateBundle(merkleRootToBeHexString(this.merkleRoot), {
+          taskId: taskId,
+          postMerkleRoot: '',
+          preMerkleRoot: preMerkleRootStr,
+          bundleIndex: this.bundleIndex
+        });
+        console.log("Updated existing bundle in global registry");
+      } catch (globalError) {
+        console.log("fatal: conflict in global bundle registry");
+        throw globalError;
+      }
     }
-    return bundleRecord;
   }
 
 
@@ -246,6 +281,10 @@ export class Service {
         // console.log(`[${getTimestamp()}] txCallback took: ${callbackEnd - callbackStart}ms`);
     }
     // }
+
+    // Event data snapshots removed: events are transaction processing outputs, not recoverable state data
+    // Events are already processed by txCallback and stored in system collections
+
     snapshot = JSON.parse(application.snapshot());
     console.log("transaction installed, rollup pool length is:", transactions_witness.length);
     try {
@@ -265,23 +304,13 @@ export class Service {
       // console.log(`[${getTimestamp()}] application.finalize took: ${finalizeEnd - preemptStart}ms`);
       console.log("txdata is:", txdata);
       let task_id = null;
-
-      // TODO: store a bundle before we fail
-      // let bundle = await this.trackBundle('');
-      if (deploymode) {
-        try {
-          task_id = await submitProofWithRetry(this.merkleRoot, transactions_witness, txdata);
-        } catch (e) {
-          console.log(e);
-          process.exit(1); // this should never happen and we stop the whole process
-        }
-      }
+      // sequence the merkle trace pre -> post merkle root
       try {
         console.log("proving task submitted at:", task_id);
         console.log("tracking task in db current ...", merkleRootToBeHexString(this.merkleRoot));
 
         // const trackStart = performance.now();
-        await this.trackBundle(task_id);
+        await this.trackBundle(task_id || '', txdata);
         // const trackEnd = performance.now();
         // console.log(`[${getTimestamp()}] trackBundle took: ${trackEnd - trackStart}ms`);
 
@@ -291,6 +320,19 @@ export class Service {
 
         // need to update merkle_root as the input of next proof
         this.merkleRoot = application.query_root();
+        
+        // New: Create state snapshot after Bundle completion
+        const bundleEndMerkleRoot = merkleRootToBeHexString(this.merkleRoot);
+        this.stateSnapshotService.updateMerkleRoot(bundleEndMerkleRoot);
+        
+        // Create state snapshot asynchronously without blocking Bundle processing
+        this.stateSnapshotService.createCompleteSnapshot()
+          .then(() => {
+            console.log(`State snapshot created for: ${bundleEndMerkleRoot}`);
+          })
+          .catch((snapshotError) => {
+            console.warn(`Failed to create state snapshot for ${bundleEndMerkleRoot}:`, snapshotError);
+          });
 
 
         // record all the txs externally so that the external db can preserve a snap shot
@@ -305,8 +347,9 @@ export class Service {
         await (initApplication as any)(bootstrap);
         application.initialize(this.merkleRoot);
         await this.txManager.moveToCommit(merkleRootToBeHexString(this.merkleRoot));
-        // const resetEnd = performance.now();
-        // console.log(`[${getTimestamp()}] Application reset took: ${resetEnd - resetStart}ms`);
+
+        // Update state snapshot service MerkleRoot to new Bundle's initial state
+        this.stateSnapshotService.updateMerkleRoot(merkleRootToBeHexString(this.merkleRoot));
       } catch (e) {
         console.log(e);
         process.exit(1); // this should never happen and we stop the whole process
@@ -331,9 +374,6 @@ export class Service {
     db.once('open', () => {
       console.log('Connected to MongoDB');
     });
-    
-    // Call ensureIndexes after connection is established
-    await ensureIndexes();
 
     console.log("connecting redis server:", redisHost);
     const connection = new IORedis(
@@ -363,15 +403,34 @@ export class Service {
     //console.log(application);
     await (initApplication as any)(bootstrap);
 
-    console.log("check merkel database connection ...");
+    console.log("check merkle database connection ...");
     test_merkle_db_service();
 
     if (migrate) {
       if (remote) {
         throw Error("Can't migrate in remote mode");
       }
+
+      // Get contract state
       this.merkleRoot = await getMerkleArray();
-      console.log("Migrate: updated merkle root", this.merkleRoot);
+      const targetMerkleRoot = merkleRootToBeHexString(this.merkleRoot);
+      console.log("Migrate: target merkle root", targetMerkleRoot);
+
+      // Execute data migration to target state
+      try {
+        await this.migrationService.migrateDataToMerkleRoot(targetMerkleRoot, this.currentMD5);
+        console.log(`Migration completed to merkleRoot: ${targetMerkleRoot}`);
+      } catch (migrationError) {
+        console.error("Migration failed:", migrationError);
+        throw migrationError;
+      }
+
+      // Start as independent new chain:
+      // - bundleIndex stays 0 (default) - new MD5 starts fresh
+      // - preMerkleRoot stays null (default) - no link to old MD5's bundles
+      // - only update latestSubmittedBundleMerkle for proof worker
+      this.latestSubmittedBundleMerkle = this.merkleRoot;
+      console.log(`Migrate: starting new independent chain from merkleRoot: ${targetMerkleRoot}`);
     } else if(remote) {
     //initialize merkle_root based on the latest task
       while (true) {
@@ -402,12 +461,12 @@ export class Service {
           BigInt(instances[2].toString()),
           BigInt(instances[3].toString()),
         ]);
-
+        this.latestSubmittedBundleMerkle = this.merkleRoot;
         this.bundleIndex = await this.findBundleIndex(this.preMerkleRoot);
         console.log("updated merkle root", this.merkleRoot, this.bundleIndex);
       }
     } else {
-      await this.syncToLatestMerkelRoot();
+      await this.syncToLatestMerkleRoot();
     }
 
     console.log("initialize sequener queue ...");
@@ -422,7 +481,9 @@ export class Service {
     console.log("initialize application merkle db ...");
 
 
-    this.txManager.loadCommit(merkleRootToBeHexString(this.merkleRoot));
+    // Ensure indexes before first use of commits collection
+    await ensureIndexes();
+    await this.txManager.loadCommit(merkleRootToBeHexString(this.merkleRoot));
     application.initialize(this.merkleRoot);
 
     // update the merkle root variable
@@ -440,7 +501,12 @@ export class Service {
       }, 5000); // Change the interval as needed (e.g., 5000ms for every 5 seconds)
     }
 
-    setInterval(() => {
+    // Initialize proof worker in deploy mode
+    if (deploymode) {
+      this.initializeProofWorker();
+    }
+    
+    setInterval(async () => {
       this.blocklist.clear();
     }, 30000);
 
@@ -459,7 +525,7 @@ export class Service {
       }
     }, 2000);
 
-    this.worker = new Worker('sequencer', async job => {
+    this.worker = new BullWorker('sequencer', async job => {
       const jobStartTime = performance.now();
       // console.log(`[${getTimestamp()}] Worker started processing job: ${job.name}, id: ${job.id}`);
       
@@ -592,6 +658,40 @@ export class Service {
     }, {connection});
   }
 
+  initializeProofWorker() {
+    try {
+      // Get absolute path for worker file
+      const __filename = fileURLToPath(import.meta.url);
+      const __dirname = dirname(__filename);
+      const workerPath = join(__dirname, 'proof-worker.js');
+      
+      this.proofWorker = new Worker(workerPath, {
+        workerData: {
+          // Worker starts with initial merkle and finds all unproved bundles independently
+          initialMerkle: Array.from(this.latestSubmittedBundleMerkle)
+        }
+      });
+
+      // Worker handles all proof tracking independently - no messages needed
+      this.proofWorker.on('error', (error) => {
+        console.error('Proof worker error:', error);
+      });
+
+      this.proofWorker.on('exit', (code) => {
+        console.log(`Proof worker exited with code ${code}`);
+        // Restart worker if it crashes
+        if (code !== 0) {
+          console.log('Restarting proof worker...');
+          setTimeout(() => this.initializeProofWorker(), 5000);
+        }
+      });
+
+      console.log('Proof worker initialized - handling all proof tracking independently');
+    } catch (error) {
+      console.error('Failed to initialize proof worker:', error);
+    }
+  }
+
   async serve() {
     // replay uncommitted transactions
     console.log("install bootstrap txs");
@@ -711,30 +811,7 @@ export class Service {
         if (merkleRootStr == 'latest') {
           merkleRootStr = merkleRootToBeHexString(this.preMerkleRoot!);
         }
-        let bundle = await modelBundle.findOne({
-          merkleRoot: merkleRootStr,
-        });
-        let after = bundle;
-        const bundles = [];
-        while (bundle != null && bundles.length < 10) {
-          bundles.unshift(bundle);
-          bundle = await modelBundle.findOne({
-            merkleRoot: (bundle.preMerkleRoot),
-          });
-        }
-        bundle = after;
-        const len = bundles.length;
-        if (bundle) {
-          bundle = await modelBundle.findOne({
-            merkleRoot: (bundle.postMerkleRoot),
-          });
-        }
-        while (bundle != null && bundles.length < len + 10) {
-          bundles.push(bundle);
-          bundle = await modelBundle.findOne({
-            merkleRoot: (bundle.postMerkleRoot),
-          });
-        }
+        const bundles = await this.globalBundleService.getBundleChain(merkleRootStr, 20);
         return res.status(201).json({
           success: true,
           data: bundles
@@ -768,8 +845,7 @@ export class Service {
     app.get('/prooftask/:root', async (req, res) => {
       try {
         let merkleRootString = req.params.root;
-        let merkleRoot = new BigUint64Array(hexStringToMerkleRoot(merkleRootString));
-        let record = await modelBundle.findOne({ merkleRoot: merkleRoot});
+        let record = await this.globalBundleService.findBundleByMerkle(merkleRootString);
         if (record) {
           return res.status(201).json(record);
         } else {
