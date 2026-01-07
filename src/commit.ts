@@ -104,7 +104,7 @@ export class TxStateManager {
       this.preemptcounter = 0;
       this.uncommittedTxs = [];
       try {
-        await CommitModel.findOneAndUpdate({
+        await CommitModel.updateOne({
           key: key
         }, {
           key: key,
@@ -128,8 +128,10 @@ export class TxStateManager {
         if (commit) {
           // If key exists, push new item to items array
           if (commit.items.length <= counter) {
-            commit.items.push(tx);
-            await commit.save();
+            await CommitModel.updateOne(
+              { _id: commit._id },
+              { $push: { items: tx } }
+            );
             return false; // new tx, needs track
           } else {
             let trackedTx = commit.items[counter];
@@ -137,12 +139,11 @@ export class TxStateManager {
             return true; // event already tracked
           }
         } else {
-          // If key does not exist, create a new commit record
-          const newCommit = new CommitModel({
-            key,
-            items: [tx], // Insert the new item as the first element
-          });
-          await newCommit.save();
+          await CommitModel.updateOne(
+            { key },
+            { $setOnInsert: { key }, $push: { items: tx } },
+            { upsert: true }
+          );
           return false;
         }
       } catch (error) {
@@ -151,4 +152,3 @@ export class TxStateManager {
       }
     };
 }
-
